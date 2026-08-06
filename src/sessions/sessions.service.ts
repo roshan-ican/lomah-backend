@@ -35,6 +35,13 @@ const STAGE_TARGET_SELECT = {
     distanceM: true,
     positionIndex: true,
     profileType: true,
+    // The board's current mounting offset. Not reachability data — it is the
+    // calibration the shots on this stage were scored against, and the admin
+    // console's offset panel is the one place it has to be readable from.
+    // Without it that panel had no server-side value to render at all, so a
+    // saved offset reported success and then reappeared as (0, 0) on reload.
+    offsetXmm: true,
+    offsetYmm: true,
   },
 } as const;
 

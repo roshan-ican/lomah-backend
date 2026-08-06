@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   ConflictException,
   Injectable,
   Logger,
@@ -20,6 +21,13 @@ import type { TargetCalibratedEvent } from './target.events';
 
 /** Prisma's code for "a unique constraint was violated". */
 const UNIQUE_VIOLATION = 'P2002';
+
+/** How a caller points at the shot a calibration is derived from. */
+type ReferenceShotRef = {
+  shotId?: string;
+  stageId?: string;
+  shotNumber?: number;
+};
 
 @Injectable()
 export class TargetsService implements OnModuleDestroy {
@@ -473,24 +481,63 @@ export class TargetsService implements OnModuleDestroy {
 
   async calibrateFromShot(
     id: string,
-    shotId: string,
+    ref: ReferenceShotRef,
     trueX: number,
     trueY: number,
   ) {
     const target = await this.findOne(id);
-    const shot = await this.prisma.shot.findUnique({
-      where: { id: shotId },
-      include: { stage: true },
-    });
-    if (!shot || shot.stage.targetId !== id) {
-      throw new NotFoundException(
-        `Shot ${shotId} does not belong to target ${id}.`,
-      );
-    }
+    const shot = await this.resolveReferenceShot(id, ref);
 
     const offsetXmm = target.offsetXmm + (trueX - shot.x);
     const offsetYmm = target.offsetYmm + (trueY - shot.y);
 
     return this.setOffset(id, offsetXmm, offsetYmm);
+  }
+
+  /**
+   * The reference shot, addressed either by row id or — the way the admin board
+   * actually holds it — by stage plus 1-based shot number. See
+   * CalibrateFromShotDto for why both forms exist.
+   *
+   * Either way the shot is re-read here rather than trusted from the request
+   * body: the caller sends only where the shot BELONGS, never where it already
+   * is, so a stale copy on the console cannot skew the derived offset.
+   */
+  private async resolveReferenceShot(targetId: string, ref: ReferenceShotRef) {
+    if (ref.shotId) {
+      const shot = await this.prisma.shot.findUnique({
+        where: { id: ref.shotId },
+        include: { stage: true },
+      });
+      if (!shot || shot.stage.targetId !== targetId) {
+        throw new NotFoundException(
+          `Shot ${ref.shotId} does not belong to target ${targetId}.`,
+        );
+      }
+      return shot;
+    }
+
+    if (ref.stageId && ref.shotNumber != null) {
+      const shot = await this.prisma.shot.findUnique({
+        where: {
+          sessionStageId_shotNumber: {
+            sessionStageId: ref.stageId,
+            shotNumber: ref.shotNumber,
+          },
+        },
+        include: { stage: true },
+      });
+      if (!shot || shot.stage.targetId !== targetId) {
+        throw new NotFoundException(
+          `Shot #${ref.shotNumber} on stage ${ref.stageId} does not belong to ` +
+            `target ${targetId}.`,
+        );
+      }
+      return shot;
+    }
+
+    throw new BadRequestException(
+      'Identify the reference shot by `shotId`, or by `stageId` and `shotNumber`.',
+    );
   }
 }

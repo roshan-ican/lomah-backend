@@ -113,20 +113,30 @@ export class TargetsController {
     return this.targetsService.writeWiper(id, dto.page, dto.wiper, dto.value);
   }
 
-  @Roles('SUPER_ADMIN')
+  /**
+   * ADMIN as well as SUPER_ADMIN, unlike every other write on this controller.
+   *
+   * A mounting offset is only discoverable by firing at the board and seeing
+   * where the group lands, so it is corrected by whoever is running the relay —
+   * and the calibration surface (LaneWorkspace / TargetView) only exists on the
+   * ADMIN board: SuperAdminDashboard has no target view to drag shots on. Held
+   * at SUPER_ADMIN, these two routes were unreachable from the only screen that
+   * calls them, so both the drag-to-calibrate flow and the manual offset save
+   * failed with 403 no matter what the admin did.
+   *
+   * Deliberately no assertNotMidRelay() on either: mounting error shows up
+   * DURING a string, and the whole point of re-scoring the active stage is that
+   * the shots already on the board move with the offset.
+   */
+  @Roles('SUPER_ADMIN', 'ADMIN')
   @Patch(':id/offset')
   setOffset(@Param('id') id: string, @Body() dto: SetTargetOffsetDto) {
     return this.targetsService.setOffset(id, dto.offsetXmm, dto.offsetYmm);
   }
 
-  @Roles('SUPER_ADMIN')
+  @Roles('SUPER_ADMIN', 'ADMIN')
   @Post(':id/calibrate')
   calibrateFromShot(@Param('id') id: string, @Body() dto: CalibrateFromShotDto) {
-    return this.targetsService.calibrateFromShot(
-      id,
-      dto.shotId,
-      dto.trueX,
-      dto.trueY,
-    );
+    return this.targetsService.calibrateFromShot(id, dto, dto.trueX, dto.trueY);
   }
 }
