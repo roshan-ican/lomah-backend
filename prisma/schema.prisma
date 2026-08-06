@@ -1,0 +1,311 @@
+// LOMAH domain model — NestJS rewrite.
+//
+// The central change from the original schema: a Lane is no longer a single
+// target. A Lane is a firing lane that CONTAINS one or more Targets standing at
+// different distances downrange (25m, 50m, 100m, 200m...). Exactly one of them
+// is engaged at a time.
+//
+// Everything that describes a piece of physical hardware — its address, how it
+// is reached, and its mounting calibration — moved from Lane onto Target. In
+// the old schema `offset_x_mm` lived on the lane, which quietly applied one
+// target's mounting error to every other target in that lane.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Range layout
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A firing lane. Designed once by a SUPER_ADMIN at commissioning; day-to-day
+/// admins run sessions against it but do not change its layout.
+model Lane {
+  id       Int    @id @default(autoincrement())
+  name     String
+  siteName String @default("")
+
+  status LaneStatus @default(AVAILABLE)
+
+  /// Which of this lane's targets is currently engaged. Null between stages.
+  /// Only one target per lane is live at a time, which is what keeps shot
+  /// attribution a single hop: frame -> target -> lane.
+  activeTargetId String? @unique
+  activeTarget   Target? @relation("ActiveTarget", fields: [activeTargetId], references: [id], onDelete: SetNull)
+
+  targets  Target[] @relation("LaneTargets")
+  sessions Session[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("lanes")
+}
+
+/// One physical target: a frame, a sensor, and the ESP32 that reports for it.
+///
+/// Identity is `deviceId` (the board's MAC) rather than an IP address. An IP is
+/// how you REACH a target; it is not what a target IS. Binding on address means
+/// swapping a dead board silently unbinds the lane until someone retypes an
+/// address.
+model Target {
+  id     String @id @default(uuid())
+  laneId Int
+  lane   Lane   @relation("LaneTargets", fields: [laneId], references: [id], onDelete: Cascade)
+
+  /// Human label used on the admin board, e.g. "200m" or "Fig-11 near".
+  label String
+
+  /// Distance downrange in metres. Drives both the UI ordering and the
+  /// expectation of which transport can actually reach this target.
+  distanceM Int
+
+  /// Ordering within the lane, nearest first.
+  positionIndex Int
+
+  // ── Reachability ──────────────────────────────────────────────────────────
+  // Every target is reached by UDP unicast to `ipAddress`, pinned by a DHCP
+  // MAC reservation on the range router. (A LoRa path was scaffolded early on
+  // for targets beyond WiFi range, then dropped — the confirmed deployment is
+  // one router, everything WiFi. If distance ever forces the question again,
+  // this is the field to bring back, alongside a second TargetTransport
+  // implementation — see src/transport/target-transport.interface.ts.)
+  ipAddress String @unique
+
+  /// Board MAC, learned from telemetry. The stable identity across IP changes.
+  deviceId String? @unique
+
+  // ── Calibration ───────────────────────────────────────────────────────────
+  // Mounting error for THIS sensor in THIS frame. Belongs to the hardware, not
+  // to the lane — see the header note.
+  offsetXmm Int @default(0)
+  offsetYmm Int @default(0)
+
+  /// Which target face is mounted, used for scoring rings.
+  /// Named `profileType`, NOT `targetId`: in the original codebase `targetId`
+  /// meant this face profile, which collides fatally with the new meaning of
+  /// "a physical target".
+  profileType TargetProfile @default(FIGURE)
+
+  // ── Health, fed by the telemetry heartbeat ────────────────────────────────
+  lastSeenAt DateTime?
+  rssi       Int?
+
+  /// Defaults to the current dev board's firmware until a real telemetry
+  /// heartbeat overwrites it with whatever the physical board reports.
+  firmwareVersion String @default("LOMAH Dev Board v0.1")
+
+  /// Every session-stage this target has ever been engaged in. Not a direct
+  /// relation to Session — a target is engaged as part of a STAGE, and a
+  /// session reaches its targets by walking its stages. See SessionStage.
+  stages SessionStage[]
+
+  /// Back-reference for Lane.activeTarget. Prisma requires both sides of every
+  /// relation to be declared, even though only Lane holds the foreign key —
+  /// otherwise it cannot tell this apart from the `LaneTargets` relation above,
+  /// which points the same two models at each other in the other direction.
+  /// No `fields`/`references` here: that side is defined on Lane.
+  activeForLane Lane? @relation("ActiveTarget")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([laneId, positionIndex])
+  @@index([laneId])
+  @@map("targets")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Firing
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The top-level firing record: one shooter, one lane, one sitting. Holds no
+/// target directly — see SessionStage. A single-target session is simply a
+/// session with exactly one stage; nothing about Session itself changes
+/// between the simple case and a multi-target drill.
+model Session {
+  id     String @id @default(uuid())
+  laneId Int
+  lane   Lane   @relation(fields: [laneId], references: [id], onDelete: Cascade)
+
+  status SessionStatus @default(CREATED)
+
+  shooterId   String?
+  shooter     Shooter? @relation(fields: [shooterId], references: [id])
+  shooterName String?
+
+  /// When the current pause began, null when running. Paired with
+  /// `totalPausedMs`: pause() stamps this, resume() folds the elapsed interval
+  /// into the total and clears it. Without the stamp there is no way to know
+  /// how long a pause lasted, and the stage clock would keep running through it.
+  pausedAt      DateTime?
+  totalPausedMs Int       @default(0)
+
+  notes     String?
+  feedback  String?
+  createdBy String?
+
+  createdAt  DateTime  @default(now())
+  startedAt  DateTime?
+  endedAt    DateTime?
+  reviewedAt DateTime?
+
+  stages SessionStage[]
+
+  @@index([laneId, status])
+  @@map("sessions")
+}
+
+/// One target engagement within a session. A single-target session has
+/// exactly one of these (order 0); a multi-target drill has several, fired
+/// in `order`. This is the thing that actually gets armed — starting stage N
+/// is what calls TargetCommandService.play() for that stage's target.
+model SessionStage {
+  id        String  @id @default(uuid())
+  sessionId String
+  session   Session @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  targetId String
+  target   Target @relation(fields: [targetId], references: [id])
+
+  /// 0-based order within the session — nearest target first, by convention,
+  /// though nothing enforces that beyond how the admin builds the sequence.
+  order Int
+
+  status    StageStatus @default(PENDING)
+  startedAt DateTime?
+  endedAt   DateTime?
+
+  // Per-stage, not per-session: a real drill gives each target its own
+  // bullet count and time budget ("5 rounds at 50m in 60s, then advance").
+  //
+  // 0 means UNLIMITED for both, and they are the two independent ways a stage
+  // can end on its own:
+  //   - bulletLimit > 0  -> SensorService advances the moment the count is hit
+  //   - durationSeconds > 0 -> StageMonitorService advances when the clock runs out
+  // With both 0 the stage is open-ended and only ends when the range officer
+  // advances it, which is the normal case for a relay run at their pace.
+  bulletLimit     Int @default(0)
+  durationSeconds Int @default(600)
+
+  /// Snapshot of the target's face profile at stage creation. Copied rather
+  /// than read live through `target`, so re-facing a target later can't
+  /// silently rescore a stage that already happened.
+  profileType TargetProfile @default(FIGURE)
+
+  shots Shot[]
+
+  @@unique([sessionId, order])
+  @@index([targetId])
+  @@map("session_stages")
+}
+
+model Shot {
+  id             String       @id @default(uuid())
+  sessionStageId String
+  stage          SessionStage @relation(fields: [sessionStageId], references: [id], onDelete: Cascade)
+
+  /// Sequence within the STAGE, 1-based — not the whole session, since a shot
+  /// only ever happens against one stage's target at a time. Distinct from the
+  /// wire-level bullet counter, which is a single byte that rolls over every
+  /// 256 shots and is unwrapped (see SequenceTracker) before it ever reaches
+  /// this layer.
+  shotNumber Int
+
+  /// Board-space millimetres, after the target's calibration offset is applied.
+  x Int
+  y Int
+
+  score  Int     @default(0)
+  isMiss Boolean @default(false)
+
+  firedAt DateTime
+
+  @@unique([sessionStageId, shotNumber])
+  @@index([sessionStageId])
+  @@map("shots")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// People
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Shooter {
+  id          String    @id @default(uuid())
+  name        String    @unique
+  rank        String?
+  badgeNumber String?   @unique
+  sessions    Session[]
+  createdAt   DateTime  @default(now())
+
+  @@map("shooters")
+}
+
+model User {
+  id           String   @id @default(uuid())
+  username     String   @unique
+  passwordHash String
+  role         UserRole @default(ADMIN)
+  createdAt    DateTime @default(now())
+
+  @@map("users")
+}
+
+/// A shooter's display device. Bound to a lane by `deviceId` rather than IP for
+/// the same reason targets are: a replaced tablet must not silently orphan a
+/// lane.
+model ClientDevice {
+  id        String    @id @default(uuid())
+  deviceId  String    @unique
+  laneId    Int?
+  label     String?
+  lastIp    String?
+  lastSeen  DateTime?
+  createdAt DateTime  @default(now())
+
+  @@map("client_devices")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Enums
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum LaneStatus {
+  AVAILABLE
+  OCCUPIED
+  MAINTENANCE
+  DISABLED
+}
+
+enum TargetProfile {
+  FIGURE
+  CIRCULAR
+}
+
+enum SessionStatus {
+  CREATED
+  ACTIVE
+  PAUSED
+  COMPLETED
+  CANCELLED
+  SUPERSEDED
+}
+
+enum StageStatus {
+  PENDING
+  ACTIVE
+  COMPLETED
+}
+
+enum UserRole {
+  /// Commissioning role. Designs lane layout, binds targets, calibrates.
+  SUPER_ADMIN
+  /// Day-to-day range operation. Runs sessions, cannot redesign lanes.
+  ADMIN
+  SHOOTER
+}

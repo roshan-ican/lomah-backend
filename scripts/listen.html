@@ -1,0 +1,101 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>LOMAH realtime — bench listener</title>
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+<style>
+  body { font: 14px ui-monospace, monospace; padding: 1.5rem; }
+  #status { font-weight: 700; margin-bottom: 1rem; }
+  .ok { color: #0a0; }
+  .bad { color: #c00; }
+  table { border-collapse: collapse; }
+  td, th { padding: 0.25rem 0.75rem; border-bottom: 1px solid #ddd; text-align: right; }
+  th { text-align: right; color: #666; font-weight: 500; }
+  td:first-child, th:first-child { text-align: left; }
+  .miss { color: #c00; }
+  #controls { margin-bottom: 1rem; display: flex; gap: 1rem; align-items: center; }
+  input { font: inherit; padding: 0.2rem; }
+</style>
+
+<div id="controls">
+  <label>token <input id="token" size="60" placeholder="paste JWT from /api/auth/login" /></label>
+  <label>lane <input id="lane" size="4" value="2" /></label>
+  <button id="go">connect</button>
+</div>
+
+<div id="status" class="bad">not connected</div>
+
+<table>
+  <thead>
+    <tr><th>target</th><th>#</th><th>x</th><th>y</th><th>score</th><th>at</th></tr>
+  </thead>
+  <tbody id="rows"></tbody>
+</table>
+
+<script>
+  // Bench listener for the realtime gateway. Serve this file (Live Server or
+  // similar) while the dev server runs, paste a JWT, connect, then fire
+  // scripts/simulate-shots.ts.
+  const status = document.getElementById('status');
+  const rows = document.getElementById('rows');
+
+  let socket;
+
+  document.getElementById('go').onclick = () => {
+    const token = document.getElementById('token').value.trim();
+    const laneId = Number(document.getElementById('lane').value);
+
+    if (socket) socket.disconnect();
+
+    // The gateway verifies this at the handshake and disconnects without it.
+    // `auth` is the correct place for it — not a query parameter, which would
+    // put the token in server logs and browser history.
+    socket = io('http://localhost:3001', {
+      transports: ['websocket'],
+      auth: { token },
+    });
+
+    socket.on('connect', () => {
+      status.textContent = 'connected — ' + socket.id;
+      status.className = 'ok';
+
+      // Admins are auto-joined to the `admin` room and see every lane. Joining
+      // a lane room as well is what a shooter tablet does.
+      socket.emit('join-lane', { laneId }, (ack) => {
+        status.textContent += ack && ack.ok
+          ? ' — joined ' + ack.room
+          : ' — join failed: ' + (ack && ack.error);
+      });
+    });
+
+    socket.on('unauthorized', (e) => {
+      status.textContent = 'rejected: ' + e.reason;
+      status.className = 'bad';
+    });
+
+    socket.on('disconnect', () => {
+      status.textContent = 'disconnected';
+      status.className = 'bad';
+    });
+
+    socket.on('connect_error', (err) => {
+      status.textContent = 'connect error: ' + err.message;
+      status.className = 'bad';
+    });
+
+    socket.on('shot', onShot);
+  };
+
+  function onShot(e) {
+    const tr = document.createElement('tr');
+    if (e.isMiss) tr.className = 'miss';
+    tr.innerHTML = [
+      e.targetLabel,
+      e.shotNumber,
+      e.isMiss ? '—' : e.x,
+      e.isMiss ? '—' : e.y,
+      e.isMiss ? 'MISS' : e.score,
+      new Date(e.firedAt).toLocaleTimeString(),
+    ].map((v) => '<td>' + v + '</td>').join('');
+    rows.prepend(tr);
+  }
+</script>
