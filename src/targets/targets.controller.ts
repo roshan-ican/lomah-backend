@@ -64,8 +64,15 @@ export class TargetsController {
     return this.targetsService.heartbeat(id);
   }
 
-  /** 'D' — which of the board's 8 sensors detected a given shot. */
-  @Roles('SUPER_ADMIN')
+  /**
+   * 'D' — which of the board's 8 sensors detected a given shot.
+   *
+   * ADMIN as well as SUPER_ADMIN: this is read-only diagnostics about a shot
+   * that already happened and changes nothing on the board, and the range
+   * admin working a lane is exactly who needs it when bullets come back as
+   * no-detection.
+   */
+  @Roles('SUPER_ADMIN', 'ADMIN')
   @Post(':id/dev-data')
   devData(@Param('id') id: string, @Body() dto: DevDataDto) {
     return this.targetsService.devData(id, dto.shot);

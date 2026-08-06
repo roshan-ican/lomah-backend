@@ -5,9 +5,15 @@ import { ConfigService } from '@nestjs/config';
 import { NestFactory } from '@nestjs/core';
 
 import { AppModule } from './app.module';
+import { BroadcastLogger } from './realtime/broadcast.logger';
 
 async function bootstrap(): Promise<void> {
-  const app = await NestFactory.create(AppModule, { bufferLogs: false });
+  // Same console output as the default logger, plus a copy of every line on
+  // serverLogs$ for the admin console's activity log.
+  const app = await NestFactory.create(AppModule, {
+    bufferLogs: false,
+    logger: new BroadcastLogger(),
+  });
   const config = app.get(ConfigService);
 
   app.setGlobalPrefix('api', { exclude: ['health'] });

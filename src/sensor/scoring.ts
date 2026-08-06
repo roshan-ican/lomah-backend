@@ -54,12 +54,14 @@ export interface ScoredShot {
  */
 const RINGS: Record<TargetProfile, ReadonlyArray<readonly [number, number]>> = {
   // Figure-11 style silhouette. Scored on a coarser band than a circular face.
+  // The face is printed 5/4/3/2 only — there is no 1 zone, so the outermost
+  // ring awards 2 all the way out to the edge of the silhouette and anything
+  // past that is a located zero, not a 1.
   FIGURE: [
     [50, 5],
     [100, 4],
     [150, 3],
-    [200, 2],
-    [300, 1],
+    [300, 2],
   ],
   // Concentric competition face, 10 down to 1.
   CIRCULAR: [

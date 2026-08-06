@@ -17,6 +17,7 @@ import { SensorService } from '@/sensor/sensor.service';
 import { SensorGateService } from '@/sensor/sensor-gate.service';
 import { SessionsService } from '@/sessions/sessions.service';
 import { TargetsService } from '@/targets/targets.service';
+import { recentServerLogs, serverLogs$ } from './server-log.stream';
 const ADMIN_ROOM = 'admin';
 /** Per-lane room. A shooter tablet joins exactly one of these. */
 const laneRoom = (laneId: number | string) => `lane:${laneId}`;
@@ -45,6 +46,7 @@ export class RealtimeGateway
   private sessionsSub?: Subscription;
   private targetsSub?: Subscription;
   private gateSub?: Subscription;
+  private logsSub?: Subscription;
 
   constructor(
     private readonly sensor: SensorService,
@@ -74,6 +76,17 @@ export class RealtimeGateway
     this.gateSub = this.gate.changes$.subscribe((status) => {
       this.server.to(ADMIN_ROOM).emit('sensor:gate', status);
     });
+
+    // The server's own log lines, mirrored into the admin activity log.
+    // NOTHING in this handler may log: it runs on every log line, so a log
+    // here would feed itself forever.
+    this.logsSub = serverLogs$.subscribe((line) => {
+      try {
+        this.server?.to(ADMIN_ROOM).emit('server:log', line);
+      } catch {
+        // Deliberately silent — see above.
+      }
+    });
   }
 
   onModuleDestroy(): void {
@@ -81,6 +94,7 @@ export class RealtimeGateway
     this.sessionsSub?.unsubscribe();
     this.targetsSub?.unsubscribe();
     this.gateSub?.unsubscribe();
+    this.logsSub?.unsubscribe();
   }
 
   async handleConnection(client: Socket): Promise<void> {
@@ -109,6 +123,11 @@ export class RealtimeGateway
 
       if (user.role === 'SUPER_ADMIN' || user.role === 'ADMIN') {
         await client.join(ADMIN_ROOM);
+        // Backlog first, so a console opened mid-relay shows what already
+        // happened instead of sitting empty until the next event.
+        for (const line of recentServerLogs()) {
+          client.emit('server:log', line);
+        }
       }
 
       this.logger.log(

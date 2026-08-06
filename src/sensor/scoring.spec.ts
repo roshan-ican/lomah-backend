@@ -83,6 +83,29 @@ describe('scoreShot', () => {
     expect(shot.score).toBe(10); // 20mm out, not 100mm
   });
 
+  it('never awards 1 on a FIGURE face — the printed zones are only 5/4/3/2', () => {
+    // Sweep the whole face outward in 5mm steps along +Y from centre. The old
+    // ring table had a [300, 1] band, so a regression here shows up as a 1
+    // rather than as a wrong-looking number somewhere no test was watching.
+    const scores = new Set<number>();
+    for (let mm = 0; mm <= 400; mm += 5) {
+      scores.add(
+        scoreShot({ ...base, rawX: 0, rawY: 500 + mm, profile: 'FIGURE' }).score,
+      );
+    }
+    expect(scores.has(1)).toBe(false);
+    expect([...scores].sort((a, b) => a - b)).toEqual([0, 2, 3, 4, 5]);
+  });
+
+  it('scores the outermost FIGURE band as 2 out to 300mm, 0 past it', () => {
+    expect(scoreShot({ ...base, rawX: 0, rawY: 700, profile: 'FIGURE' }).score)
+      .toBe(2); // 200mm out — was the old [200,2] edge
+    expect(scoreShot({ ...base, rawX: 0, rawY: 800, profile: 'FIGURE' }).score)
+      .toBe(2); // 300mm out — used to score 1
+    expect(scoreShot({ ...base, rawX: 0, rawY: 805, profile: 'FIGURE' }).score)
+      .toBe(0); // past the silhouette
+  });
+
   it('scores the same coordinates differently per profile', () => {
     const coords = { rawX: 60, rawY: 500, offsetXmm: 0, offsetYmm: 0 };
     const circular = scoreShot({ ...coords, profile: 'CIRCULAR' });

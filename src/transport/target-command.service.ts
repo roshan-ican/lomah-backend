@@ -172,8 +172,12 @@ export class TargetCommandService implements OnModuleInit, OnModuleDestroy {
       this.logger.warn(
         `${target.label} never acknowledged PLAY — check power and association.`,
       );
+      return false;
     }
-    return ok === true;
+    // The board echoed PLAY back at us — that echo IS the handshake, so this
+    // is the one place that can honestly say the target is armed.
+    this.logger.log(`🤝 ${target.label} echoed PLAY — handshake complete, armed.`);
+    return true;
   }
 
   /**

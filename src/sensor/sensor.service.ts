@@ -5,6 +5,7 @@ import {
   OnModuleDestroy,
   OnModuleInit,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import type { Target } from '@prisma/client';
 import { Subject, type Observable, type Subscription } from 'rxjs';
 
@@ -57,6 +58,18 @@ export class SensorService implements OnModuleInit, OnModuleDestroy {
    */
   private readonly queues = new Map<string, Promise<unknown>>();
 
+  /**
+   * Whether to ask a board to re-send a bullet we never received.
+   *
+   * Defaults OFF: the deployed firmware does not implement RESEND ('R'), so
+   * every request was a frame the board silently discarded — noise on the wire
+   * and a misleading "resend requested" in the log implying recovery was under
+   * way when nothing was coming. Gap DETECTION is unaffected and still logged;
+   * only the outbound request is suppressed. Set SENSOR_RESEND_ENABLED=true if
+   * a firmware build that supports it is ever deployed.
+   */
+  private readonly resendEnabled: boolean;
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly registry: TransportRegistry,
@@ -65,7 +78,10 @@ export class SensorService implements OnModuleInit, OnModuleDestroy {
     private readonly resolver: TargetResolver,
     private readonly sessions: SessionsService,
     private readonly gate: SensorGateService,
-  ) {}
+    config: ConfigService,
+  ) {
+    this.resendEnabled = config.get<string>('SENSOR_RESEND_ENABLED', 'false') === 'true';
+  }
 
   onModuleInit(): void {
     this.sub = this.registry.frames$.subscribe((frame) => {
@@ -142,9 +158,6 @@ export class SensorService implements OnModuleInit, OnModuleDestroy {
     const target = await this.resolver.resolve(frame.sourceKey);
     if (!target) return;
 
-    // Dedup on the UNWRAPPED absolute sequence, never the raw byte. The raw
-    // counter is one byte and rolls over every 256 shots; deduping on it
-    // discards every shot past the first wrap. See SequenceTracker.
     const { absolute, duplicate, gaps } = this.sequence.observe(
       target.id,
       frame.bulletCounter,
@@ -153,18 +166,23 @@ export class SensorService implements OnModuleInit, OnModuleDestroy {
 
     // Best-effort, deliberately not awaited: a resend request must not delay
     // persisting the bullet already in hand.
-    for (const gap of gaps) {
-      void this.targetCommand
-        .resend(this.targetRef(target), gap & 0xff)
-        .catch((err: Error) =>
-          this.logger.warn(
-            `Resend ${gap} -> ${target.label} failed: ${err.message}`,
-          ),
-        );
+    if (this.resendEnabled) {
+      for (const gap of gaps) {
+        void this.targetCommand
+          .resend(this.targetRef(target), gap & 0xff)
+          .catch((err: Error) =>
+            this.logger.warn(
+              `Resend ${gap} -> ${target.label} failed: ${err.message}`,
+            ),
+          );
+      }
     }
     if (gaps.length > 0) {
       this.logger.warn(
-        `${target.label}: missing bullet(s) ${gaps.join(', ')} before #${absolute} — resend requested.`,
+        `${target.label}: missing bullet(s) ${gaps.join(', ')} before #${absolute}` +
+          (this.resendEnabled
+            ? ' — resend requested.'
+            : ' — dropped (resend disabled).'),
       );
     }
 
