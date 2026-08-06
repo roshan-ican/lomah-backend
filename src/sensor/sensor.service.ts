@@ -21,7 +21,7 @@ import { TransportRegistry } from '@/transport/transport.registry';
 
 import { SessionsService } from '@/sessions/sessions.service';
 
-import { scoreShot } from './scoring';
+import { scoreShot, isSentinel } from './scoring';
 import type { ShotEvent } from './sensor.events';
 import { TargetResolver } from './target-resolver.service';
 import { SensorGateService } from './sensor-gate.service';
@@ -59,14 +59,16 @@ export class SensorService implements OnModuleInit, OnModuleDestroy {
   private readonly queues = new Map<string, Promise<unknown>>();
 
   /**
-   * Whether to ask a board to re-send a bullet we never received.
+   * Whether to ask a board to re-send a bullet we never received, or one we
+   * received as a (0,0) no-detection frame.
    *
    * Defaults OFF: the deployed firmware does not implement RESEND ('R'), so
    * every request was a frame the board silently discarded — noise on the wire
    * and a misleading "resend requested" in the log implying recovery was under
-   * way when nothing was coming. Gap DETECTION is unaffected and still logged;
-   * only the outbound request is suppressed. Set SENSOR_RESEND_ENABLED=true if
-   * a firmware build that supports it is ever deployed.
+   * way when nothing was coming. Gap DETECTION and MISS DETECTION are
+   * unaffected and still logged; only the outbound request is suppressed. Set
+   * SENSOR_RESEND_ENABLED=true if a firmware build that supports it is ever
+   * deployed.
    */
   private readonly resendEnabled: boolean;
 
@@ -184,6 +186,30 @@ export class SensorService implements OnModuleInit, OnModuleDestroy {
             ? ' — resend requested.'
             : ' — dropped (resend disabled).'),
       );
+    }
+
+    // An 'L' frame carrying a no-detection sentinel — (0,0) or (65535,65535),
+    // see scoring.ts — means not all the sensors detected the bullet: the board
+    // resolved no location (sensor-values.md). Ask it to re-send so a real
+    // coordinate can come back, same machinery as the gap resend above. The
+    // shot is still scored as a miss regardless, so a board that never recovers
+    // does not lose the round.
+    if (isSentinel(frame.rawX, frame.rawY)) {
+      this.logger.warn(
+        `${target.label}: shot #${absolute} reported no detection (${frame.rawX}, ${frame.rawY}).` +
+          (this.resendEnabled
+            ? ' Requesting resend.'
+            : ' Resend disabled — counted as a miss.'),
+      );
+      if (this.resendEnabled) {
+        void this.targetCommand
+          .resend(this.targetRef(target), frame.bulletCounter)
+          .catch((err: Error) =>
+            this.logger.warn(
+              `Resend ${absolute} -> ${target.label} failed: ${err.message}`,
+            ),
+          );
+      }
     }
 
     this.serialize(target.id, () => this.persistHit(target, frame));

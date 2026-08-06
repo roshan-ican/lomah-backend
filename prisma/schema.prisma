@@ -171,7 +171,7 @@ model SessionStage {
   session   Session @relation(fields: [sessionId], references: [id], onDelete: Cascade)
 
   targetId String
-  target   Target @relation(fields: [targetId], references: [id])
+  target   Target @relation(fields: [targetId], references: [id], onDelete: Cascade)
 
   /// 0-based order within the session — nearest target first, by convention,
   /// though nothing enforces that beyond how the admin builds the sequence.

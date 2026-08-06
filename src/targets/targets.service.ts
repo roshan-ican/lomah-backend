@@ -428,6 +428,10 @@ export class TargetsService implements OnModuleDestroy {
       );
     }
 
+    this.logger.log(
+      `WIPER → ${target.label} (${target.ipAddress}): ${page}${wiper} set to ${value}`,
+    );
+
     return {
       targetId: id,
       page,
