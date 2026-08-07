@@ -38,6 +38,9 @@ import { RolesGuard } from './guards/roles.guard';
   // guard runs in an HTTP context and reads req.headers, which a WebSocket
   // connection does not have — so the gateway does its own verification and
   // needs the same configured JwtService.
-  exports: [AuthService, JwtModule],
+  // ConnectedShootersService is exported so RealtimeGateway can subscribe to
+  // its assignments$ stream and push a lane binding straight to the waiting
+  // tablet, instead of that tablet discovering it on the next poll tick.
+  exports: [AuthService, ConnectedShootersService, JwtModule],
 })
 export class AuthModule {}

@@ -12,7 +12,20 @@ export interface TargetRef {
   laneId: string;
   label: string;
   transport: TransportKind;
+  /** Where the board reports FROM. This is the identity half — see
+   *  sourceKeyOf, which matches inbound datagrams on it. */
   ipAddress: string;
+  /** Where commands are sent TO, when that differs from `ipAddress`.
+   *
+   *  For range hardware it never does, and both stay null. A simulated or
+   *  containerised target is the case that needs them: it reports from its
+   *  bridge IP but is only reachable on a published loopback port, so
+   *  commanding it at `ipAddress` goes nowhere. Kept separate from
+   *  `ipAddress` rather than overwriting it, because overwriting would break
+   *  the inbound match. */
+  commandHost?: string | null;
+  /** Port override for command unicasts. Null means the transport default. */
+  commandPort?: number | null;
 }
 
 export interface InBoundFrame {

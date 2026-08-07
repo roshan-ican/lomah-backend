@@ -159,13 +159,22 @@ export class TargetsService implements OnModuleDestroy {
     }
   }
 
-  private refOf(target: { id: string; laneId: number; label: string; ipAddress: string }) {
+  private refOf(target: {
+    id: string;
+    laneId: number;
+    label: string;
+    ipAddress: string;
+    commandHost?: string | null;
+    commandPort?: number | null;
+  }) {
     return {
       id: target.id,
       laneId: String(target.laneId),
       label: target.label,
       transport: 'WIFI' as const,
       ipAddress: target.ipAddress,
+      commandHost: target.commandHost ?? null,
+      commandPort: target.commandPort ?? null,
     };
   }
 

@@ -102,24 +102,117 @@ export class SessionsService implements OnModuleDestroy {
       );
     }
 
-    const session = await this.prisma.session.create({
-      data: {
+    // ── ONE OPEN SESSION PER LANE ────────────────────────────────────────────
+    //
+    // Nothing enforced this before, and the whole rest of the system assumes
+    // it: findActiveByLane is a findFirst, the admin console's lane grid does
+    // `sessions.find(s => s.laneId === n)`, and every command in the console
+    // addresses the ONE session id held in that lane's channel state.
+    //
+    // So a second open session on a lane is not a harmless duplicate — it is
+    // an orphan. It can never be started, stopped or ended by any UI, it keeps
+    // coming back from GET /sessions forever, and which of the two the grid
+    // shows after a reload is decided by createdAt ordering rather than by
+    // anything the operator did. That is exactly how an edit could report
+    // success and then reappear as the pre-edit plan on the next refresh.
+    //
+    // "Edit Config" is the legitimate reason to want a replacement, and it
+    // says so explicitly via replaceExisting. Everything else is a bug in the
+    // caller and gets told what is in the way, by id and status, instead of a
+    // generic 400.
+    const open = await this.prisma.session.findFirst({
+      where: {
         laneId: dto.laneId,
-        shooterId: dto.shooterId,
-        shooterName: dto.shooterName,
-        stages: {
-          create: dto.stages.map((stage, index) => ({
-            target: { connect: { id: stage.targetId } },
-            order: index,
-            bulletLimit: stage.bulletLimit,
-            durationSeconds: stage.durationSeconds,
-          })),
-        },
+        status: { in: ['CREATED', 'ACTIVE', 'PAUSED'] },
       },
-      include: {
-        stages: true,
-      },
+      orderBy: { createdAt: 'desc' },
     });
+
+    if (open && !dto.replaceExisting) {
+      throw new BadRequestException(
+        `Lane ${dto.laneId} already has an open session (${open.id}, ${open.status}). ` +
+        `End or discard it before configuring a new one.`,
+      );
+    }
+
+    // A relay that has already gone downrange is not something an edit may
+    // quietly throw away — there are shots recorded against its stages and a
+    // target armed against its id. Refuse, and name the status so the console
+    // can tell the operator what to do about it.
+    if (open && open.status !== 'CREATED') {
+      // The remedy differs by status, and telling a range officer to "pause"
+      // a session that is already paused is the kind of not-quite-true message
+      // that costs more time than saying nothing.
+      const remedy =
+        open.status === 'ACTIVE'
+          ? 'Pause it first, then end or discard it'
+          : 'End it or discard it';
+      throw new BadRequestException(
+        `Session ${open.id} on lane ${dto.laneId} is ${open.status} and cannot be edited. ` +
+        `${remedy} before changing the plan.`,
+      );
+    }
+
+    // Replace and create in ONE transaction. Cancelling the old session and
+    // then failing to write the new one would leave the lane empty and the
+    // operator's plan gone — the failure mode this whole change exists to
+    // remove. Either the lane ends up with exactly the new plan, or it is left
+    // untouched with the old one still intact.
+    const endedAt = new Date();
+    const session = await this.prisma.$transaction(async (tx) => {
+      if (open) {
+        await tx.session.update({
+          where: { id: open.id },
+          data: { status: 'CANCELLED', endedAt },
+        });
+      }
+
+      return tx.session.create({
+        data: {
+          laneId: dto.laneId,
+          shooterId: dto.shooterId,
+          shooterName: dto.shooterName,
+          notes: dto.notes,
+          stages: {
+            create: dto.stages.map((stage, index) => ({
+              target: { connect: { id: stage.targetId } },
+              order: index,
+              bulletLimit: stage.bulletLimit,
+              durationSeconds: stage.durationSeconds,
+            })),
+          },
+        },
+        include: {
+          stages: true,
+        },
+      });
+    });
+
+    // Announce the replacement BEFORE the creation, and announce it at all.
+    //
+    // The console used to do this itself by calling POST /:id/stop before
+    // POST /sessions, which is what broadcast the cancel to every other admin
+    // screen. Now that the swap happens here, the event has to happen here
+    // too, or a second console watching this lane keeps showing the old plan
+    // until something unrelated forces a resync — the exact "it looked saved
+    // on one screen and not the other" symptom.
+    //
+    // Order matters: the client's handler for this event ignores a completion
+    // that names a session the lane has already moved on from, so cancel-then-
+    // create repaints correctly while create-then-cancel could blank the new
+    // session on a slow client.
+    if (open) {
+      this.logger.log(
+        `Lane ${dto.laneId}: session ${open.id} replaced by ${session.id} (edit).`,
+      );
+      this.events.next({
+        type: 'session:completed',
+        laneId: dto.laneId,
+        sessionId: open.id,
+        status: 'CANCELLED',
+        endedAt,
+      });
+    }
     this.events.next({
       type: 'session:created',
       laneId: session.laneId,
@@ -620,7 +713,15 @@ export class SessionsService implements OnModuleDestroy {
 
   private async targetRef(laneId: number, targetId: string) {
     const target = await this.prisma.target.findUniqueOrThrow({ where: { id: targetId } });
-    return { id: target.id, laneId: String(laneId), label: target.label, transport: 'WIFI' as const, ipAddress: target.ipAddress };
+    return {
+      id: target.id,
+      laneId: String(laneId),
+      label: target.label,
+      transport: 'WIFI' as const,
+      ipAddress: target.ipAddress,
+      commandHost: target.commandHost,
+      commandPort: target.commandPort,
+    };
   }
 
   onModuleDestroy(): void {

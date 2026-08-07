@@ -23,6 +23,19 @@ export class CreateTargetDto {
     @IsString()
     ipAddress!: string;
 
+    // Command address override. Null is meaningful and must survive validation:
+    // it is how the admin panel CLEARS an override and returns the target to
+    // being commanded at `ipAddress`. `@IsOptional()` already permits null,
+    // where `@IsString()` alone would reject it.
+    @IsOptional()
+    @IsString()
+    commandHost?: string | null;
+
+    @IsOptional()
+    @IsInt()
+    @Min(1)
+    commandPort?: number | null;
+
     @IsOptional()
     @IsInt()
     offsetXmm?: number;

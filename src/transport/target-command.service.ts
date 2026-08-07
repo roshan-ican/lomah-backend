@@ -197,7 +197,22 @@ export class TargetCommandService implements OnModuleInit, OnModuleDestroy {
     // Deliberately NOT queued — SensorService fires this off the hot ingest
     // path (see its serialize()) and it must not be able to queue behind a
     // multi-second self-test or wiper round-trip.
-    await this.registry.send(target, buildResendFrame(bulletCounter));
+    const frame = buildResendFrame(bulletCounter);
+
+    // Log the exact outbound datagram.
+    //
+    // RESEND is fire-and-forget: nothing acks it, and the deployed firmware
+    // may not implement 'R' at all. So the only evidence that a request was
+    // made — and the only way to tell "the board ignored us" from "we never
+    // actually sent anything" — is the bytes on the way out. Without this the
+    // feature is unfalsifiable from the log: a silent resend and a resend that
+    // was never attempted look identical.
+    this.logger.log(
+      `↩ RESEND #${bulletCounter} -> ${target.label} (${target.ipAddress}) ` +
+      `frame=[${frame.toString('hex').match(/../g)?.join(' ')}]`,
+    );
+
+    await this.registry.send(target, frame);
   }
 
   /**
