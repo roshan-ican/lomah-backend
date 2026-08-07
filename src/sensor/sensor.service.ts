@@ -69,7 +69,7 @@ export class SensorService implements OnModuleInit, OnModuleDestroy {
 
   private readonly pendingGaps = new Map<
     string,
-    Map<number, { timer: NodeJS.Timeout; attempts: number }>
+    Map<number, { timer: NodeJS.Timeout; lostTimer: NodeJS.Timeout; attempts: number }>
   >();
 
   /**
@@ -96,7 +96,9 @@ export class SensorService implements OnModuleInit, OnModuleDestroy {
   ) {
     this.resendEnabled = config.get<string>('SENSOR_RESEND_ENABLED', 'false') === 'true';
     this.resendGraceMs = Number(config.get<string>('RESEND_GRACE_MS', '150'));
-    this.maxResendAttempts = Number(config.get<string>('MAX_RESEND_ATTEMPTS', '2'));
+   this.maxResendAttempts = Number(
+  config.get('MAX_RESEND_ATTEMPTS', '0'),
+);
   }
 
   onModuleInit(): void {
@@ -152,52 +154,123 @@ export class SensorService implements OnModuleInit, OnModuleDestroy {
   }
 
 
-  private scheduleGapResend(target: Target, absolute: number): void {
-    const pending = this.pendingGaps.get(target.id) ?? new Map();
-    this.pendingGaps.set(target.id, pending);
+private scheduleGapResend(target: Target, absolute: number): void {
+  const pending = this.pendingGaps.get(target.id) ?? new Map();
+  this.pendingGaps.set(target.id, pending);
 
-    if (pending.has(absolute)) return;
+  if (pending.has(absolute)) return;
 
-    const attempt = (attemptsSoFar: number): void => {
-      if (this.sequence.hasSeen(target.id, absolute)) {
-        this.clearGap(target.id, absolute);
-        return;
-      }
+  const MAX_RETRY_DELAY_MS = 5000;
+  const LOST_TIMEOUT_MS = 60000; // after 60s, mark as lost
 
-      if (attemptsSoFar >= this.maxResendAttempts) {
-        this.clearGap(target.id, absolute);
+  let lostTimer: NodeJS.Timeout;
+
+  const attempt = (attemptsSoFar: number): void => {
+    // Bullet arrived while waiting
+    if (this.sequence.hasSeen(target.id, absolute)) {
+      clearTimeout(lostTimer);
+      this.clearGap(target.id, absolute);
+      return;
+    }
+
+    if (this.maxResendAttempts > 0 && attemptsSoFar >= this.maxResendAttempts) {
+      this.logger.warn(
+        `${target.label}: max resend attempts reached for bullet #${absolute}`,
+      );
+      this.clearGap(target.id, absolute);
+      void this.serializeAndWait(target.id, () => this.publishLost(target, absolute));
+      return;
+    }
+
+    this.logger.warn(
+      `${target.label}: requesting missing bullet #${absolute} ` +
+      `(attempt ${attemptsSoFar + 1})`,
+    );
+
+    void this.targetCommand
+      .resend(this.targetRef(target), absolute & 0xff)
+      .catch((err: Error) =>
         this.logger.warn(
-          `${target.label}: bullet #${absolute} never arrived after ` +
-            `${this.maxResendAttempts} resend request(s) — giving up, lost.`,
-        );
-        // The placeholder row is now permanent. Announce it so connected
-        // clients show the hole instead of quietly renumbering around it.
-        this.serialize(target.id, () => this.publishLost(target, absolute));
-        return;
-      }
+          `Resend #${absolute} -> ${target.label} failed: ${err.message}`,
+        ),
+      );
 
-      void this.targetCommand
-        .resend(this.targetRef(target), absolute & 0xff)
-        .catch((err: Error) =>
-          this.logger.warn(
-            `Resend #${absolute} -> ${target.label} failed: ${err.message}`,
-          ),
-        );
+    const entry = pending.get(absolute);
 
-      const entry = pending.get(absolute);
-      if (entry) {
-        entry.attempts = attemptsSoFar + 1;
-        entry.timer = setTimeout(() => attempt(attemptsSoFar + 1), this.resendGraceMs);
-        // A pending resend must never hold the process open on shutdown.
-        entry.timer.unref?.();
-      }
-    };
+    if (!entry) return;
 
-    const timer = setTimeout(() => attempt(0), this.resendGraceMs);
-    timer.unref?.();
-    pending.set(absolute, { timer, attempts: 0 });
-  }
+    entry.attempts = attemptsSoFar + 1;
 
+    // Exponential backoff:
+    // 150ms -> 300ms -> 600ms -> 1200ms -> 2400ms -> 4800ms...
+    const delay = Math.min(
+      this.resendGraceMs * Math.pow(2, attemptsSoFar),
+      MAX_RETRY_DELAY_MS,
+    );
+
+    entry.timer = setTimeout(
+      () => attempt(attemptsSoFar + 1),
+      delay,
+    );
+
+    entry.timer.unref?.();
+  };
+
+
+  // Safety timeout:
+  // If the board truly lost the shot forever, eventually close it.
+  lostTimer = setTimeout(() => {
+    if (this.sequence.hasSeen(target.id, absolute)) {
+      this.clearGap(target.id, absolute);
+      return;
+    }
+
+    this.logger.warn(
+      `${target.label}: bullet #${absolute} missing after ${LOST_TIMEOUT_MS}ms — marking lost.`,
+    );
+
+    this.clearGap(target.id, absolute);
+
+    void this.serializeAndWait(target.id, () =>
+      this.publishLost(target, absolute),
+    );
+
+  }, LOST_TIMEOUT_MS);
+
+  lostTimer.unref?.();
+
+
+  const timer = setTimeout(
+    () => attempt(0),
+    this.resendGraceMs,
+  );
+
+  timer.unref?.();
+
+  pending.set(absolute, {
+    timer,
+    lostTimer,
+    attempts: 0,
+  });
+}
+private serializeAndWait<T>(
+  targetId: string,
+  work: () => Promise<T>,
+): Promise<T> {
+  const tail = this.queues.get(targetId) ?? Promise.resolve();
+
+  const next = tail.then(work);
+
+  this.queues.set(
+    targetId,
+    next.then(
+      () => undefined,
+      () => undefined,
+    ),
+  );
+
+  return next;
+}
   /** The bullet turned up. Stop chasing it. */
   private gapArrived(targetId: string, absolute: number): void {
     const pending = this.pendingGaps.get(targetId);
@@ -208,23 +281,33 @@ export class SensorService implements OnModuleInit, OnModuleDestroy {
     this.clearGap(targetId, absolute);
   }
 
-  private clearGap(targetId: string, absolute: number): void {
-    const pending = this.pendingGaps.get(targetId);
-    const entry = pending?.get(absolute);
-    if (!entry) return;
-    clearTimeout(entry.timer);
-    pending!.delete(absolute);
-    if (pending!.size === 0) this.pendingGaps.delete(targetId);
+private clearGap(targetId: string, absolute: number): void {
+  const pending = this.pendingGaps.get(targetId);
+  const entry = pending?.get(absolute);
+
+  if (!entry) return;
+
+  clearTimeout(entry.timer);
+  clearTimeout(entry.lostTimer);
+
+  pending!.delete(absolute);
+
+  if (pending!.size === 0) {
+    this.pendingGaps.delete(targetId);
+  }
+}
+  /** Drop every outstanding chase (shutdown). */
+private clearAllGaps(): void {
+  for (const pending of this.pendingGaps.values()) {
+    for (const entry of pending.values()) {
+      clearTimeout(entry.timer);
+      clearTimeout(entry.lostTimer);
+    }
   }
 
-  /** Drop every outstanding chase (shutdown). */
-  private clearAllGaps(): void {
-    for (const pending of this.pendingGaps.values()) {
-      for (const entry of pending.values()) clearTimeout(entry.timer);
-    }
-    this.pendingGaps.clear();
-    this.reservedSlots.clear();
-  }
+  this.pendingGaps.clear();
+  this.reservedSlots.clear();
+}
 
   // ── Lost bullets ───────────────────────────────────────────────────────────
 
@@ -245,7 +328,7 @@ export class SensorService implements OnModuleInit, OnModuleDestroy {
     const key = slotKey(target.id, absolute);
     if (this.reservedSlots.has(key)) return;
 
-    const stage = await this.prisma.sessionStage.findFirst({
+    const stage = await this.prisma.sessionStage?.findFirst({
       where: { targetId: target.id, status: 'ACTIVE' },
       include: { _count: { select: { shots: true } } },
     });
@@ -256,7 +339,7 @@ export class SensorService implements OnModuleInit, OnModuleDestroy {
     // matching what persistHit does with a real one that overruns.
     if (stage.bulletLimit > 0 && shotNumber > stage.bulletLimit) return;
 
-    await this.prisma.shot.create({
+    await this.prisma.shot?.create({
       data: {
         sessionStageId: stage.id,
         shotNumber,
@@ -275,12 +358,34 @@ export class SensorService implements OnModuleInit, OnModuleDestroy {
       `${target.label}: reserved shot #${shotNumber} for missing bullet ` +
         `#${absolute} — placeholder written so later shots keep their numbers.`,
     );
+  }
 
-    // A lost round is still a round off the allowance. If it was the last one,
-    // nothing else is coming to trip the advance, so it falls to the
-    // placeholder — otherwise the stage hangs waiting for a bullet that the
-    // resend has already been told is gone.
-    if (stage.bulletLimit > 0 && shotNumber >= stage.bulletLimit) {
+  /** Giving up is final: announce the placeholder to connected clients. */
+  private async publishLost(target: Target, absolute: number): Promise<void> {
+    const key = slotKey(target.id, absolute);
+    const slot = this.reservedSlots.get(key);
+    if (!slot) return;
+    this.reservedSlots.delete(key);
+
+    const row = await this.prisma.shot?.findUnique({
+      where: {
+        sessionStageId_shotNumber: {
+          sessionStageId: slot.stageId,
+          shotNumber: slot.shotNumber,
+        },
+      },
+    });
+    // Cleared isLost means the bullet landed after all and persistHit already
+    // announced the real thing; a missing row means the stage was torn down.
+    if (!row?.isLost) return;
+
+    const stage = await this.prisma.sessionStage?.findUnique({
+      where: { id: slot.stageId },
+      include: { _count: { select: { shots: true } } },
+    });
+    if (!stage) return;
+
+    if (stage.bulletLimit > 0 && slot.shotNumber >= stage.bulletLimit) {
       this.logger.log(
         `${target.label}: bullet limit ${stage.bulletLimit} reached on a lost ` +
           `bullet — advancing stage.`,
@@ -293,32 +398,6 @@ export class SensorService implements OnModuleInit, OnModuleDestroy {
           ),
         );
     }
-  }
-
-  /** Giving up is final: announce the placeholder to connected clients. */
-  private async publishLost(target: Target, absolute: number): Promise<void> {
-    const key = slotKey(target.id, absolute);
-    const slot = this.reservedSlots.get(key);
-    if (!slot) return;
-    this.reservedSlots.delete(key);
-
-    const row = await this.prisma.shot.findUnique({
-      where: {
-        sessionStageId_shotNumber: {
-          sessionStageId: slot.stageId,
-          shotNumber: slot.shotNumber,
-        },
-      },
-    });
-    // Cleared isLost means the bullet landed after all and persistHit already
-    // announced the real thing; a missing row means the stage was torn down.
-    if (!row?.isLost) return;
-
-    const stage = await this.prisma.sessionStage.findUnique({
-      where: { id: slot.stageId },
-      include: { _count: { select: { shots: true } } },
-    });
-    if (!stage) return;
 
     this.shots.next({
       laneId: target.laneId,
@@ -372,7 +451,9 @@ export class SensorService implements OnModuleInit, OnModuleDestroy {
     );
     if (duplicate) return;
 
-    this.gapArrived(target.id, absolute);
+    if (this.sequence.hasSeen(target.id, absolute)) {
+      this.gapArrived(target.id, absolute);
+    }
 
 
     if (gaps.length > 0) {
@@ -393,25 +474,15 @@ export class SensorService implements OnModuleInit, OnModuleDestroy {
             `or its bullet counter was reset mid-stage.`,
         );
       } else {
-        // Reserve each hole's row BEFORE the frame that exposed it is written.
-        // shotNumber is allocated as "rows so far + 1", so an unreserved hole
-        // does not leave a gap in the numbering — it silently shifts every
-        // later shot down by one, and the #7 on the shooter's screen becomes
-        // the bullet the board called #8. Queuing the reservations on the same
-        // serialize chain is what makes that ordering guaranteed rather than a
-        // race between two awaits.
         for (const gap of gaps) {
-          this.serialize(target.id, () =>
+          await this.serializeAndWait(target.id, () =>
             this.reserveLostSlot(target, gap, frame.receivedAt),
           );
-        }
 
-        if (this.resendEnabled) {
-          for (const gap of gaps) this.scheduleGapResend(target, gap);
-        } else {
-          // Nothing is going to chase it, so the placeholder is already final.
-          for (const gap of gaps) {
-            this.serialize(target.id, () => this.publishLost(target, gap));
+          if (this.resendEnabled) {
+            this.scheduleGapResend(target, gap);
+          } else {
+            await this.serializeAndWait(target.id, () => this.publishLost(target, gap));
           }
         }
       }
@@ -453,7 +524,7 @@ export class SensorService implements OnModuleInit, OnModuleDestroy {
     };
 
     return new Promise<ShotEvent>((resolve, reject) => {
-      this.serialize(target.id, async () => {
+      void this.serializeAndWait(target.id, async () => {
         try {
           const event = await this.persistHit(target, frame);
           if (!event) {
