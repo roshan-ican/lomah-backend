@@ -27,8 +27,27 @@ import { TargetResolver } from './target-resolver.service';
 import { SensorGateService } from './sensor-gate.service';
 
 /**
- * Ingestion: frame -> target -> lane -> active stage -> Shot row.
+ * How many consecutive holes we are willing to call "lost bullets" and write
+ * placeholder rows for.
+ *
+ * A shooter can plausibly lose a handful of datagrams to a weak link. They
+ * cannot plausibly lose thirty in a row and keep firing — that pattern means
+ * the sequence anchor is desynced (a board reboot, a counter reset, a target
+ * swapped underneath us), and fabricating a row per hole would bury the real
+ * shots under invented ones. Past this many, log and leave the numbering alone.
  */
+const MAX_PLACEHOLDER_BURST = 8;
+
+/** Where a reserved-but-unfilled bullet is parked, pending resend. */
+interface ReservedSlot {
+  stageId: string;
+  shotNumber: number;
+}
+
+function slotKey(targetId: string, absolute: number): string {
+  return `${targetId}:${absolute}`;
+}
+
 @Injectable()
 export class SensorService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(SensorService.name);
@@ -36,41 +55,34 @@ export class SensorService implements OnModuleInit, OnModuleDestroy {
   private sub?: Subscription;
   private sessionsSub?: Subscription;
 
-  /**
-   * Shots as they are persisted. The realtime gateway subscribes to this.
-   *
-   * The dependency points THIS way on purpose: SensorService knows nothing
-   * about sockets, rooms, or connected clients — it just announces what
-   * happened. RealtimeModule imports SensorModule, never the reverse. Same
-   * shape as TransportRegistry.frames$ one layer down, and it keeps the two
-   * modules independently testable (and avoids a circular import, which is
-   * what you'd get the moment ingestion tried to call the gateway directly).
-   */
   private readonly shots = new Subject<ShotEvent>();
   readonly shots$: Observable<ShotEvent> = this.shots.asObservable();
 
-  /**
-   * Per-target serialisation. `frames$` is a stream and the handler is async,
-   * so without this two bullets arriving inside the same tick both read
-   * "shots so far = N" and both write N+1 — overrunning the bullet limit and
-   * colliding on shotNumber. The original backend carried the same queue for
-   * the same reason (`laneQueues` in services/shot.ingestion.ts).
-   */
   private readonly queues = new Map<string, Promise<unknown>>();
 
-  /**
-   * Whether to ask a board to re-send a bullet we never received, or one we
-   * received as a (0,0) no-detection frame.
-   *
-   * Defaults OFF: the deployed firmware does not implement RESEND ('R'), so
-   * every request was a frame the board silently discarded — noise on the wire
-   * and a misleading "resend requested" in the log implying recovery was under
-   * way when nothing was coming. Gap DETECTION and MISS DETECTION are
-   * unaffected and still logged; only the outbound request is suppressed. Set
-   * SENSOR_RESEND_ENABLED=true if a firmware build that supports it is ever
-   * deployed.
-   */
   private readonly resendEnabled: boolean;
+
+  private readonly resendGraceMs: number;
+
+  private readonly maxResendAttempts: number;
+
+
+  private readonly pendingGaps = new Map<
+    string,
+    Map<number, { timer: NodeJS.Timeout; lostTimer: NodeJS.Timeout; attempts: number }>
+  >();
+
+  /**
+   * Placeholder rows written for holes we are still chasing, keyed
+   * `${targetId}:${absolute}`.
+   *
+   * Exists because shotNumber is stage-relative ("rows so far + 1") while the
+   * sequence tracker counts board-lifetime bullets, so there is no arithmetic
+   * that maps one onto the other. The slot is recorded at reserve time and
+   * looked up again if the bullet lands late, which is what lets a resend fill
+   * its own row rather than take a fresh number at the end of the list.
+   */
+  private readonly reservedSlots = new Map<string, ReservedSlot>();
 
   constructor(
     private readonly prisma: PrismaService,
@@ -83,19 +95,18 @@ export class SensorService implements OnModuleInit, OnModuleDestroy {
     config: ConfigService,
   ) {
     this.resendEnabled = config.get<string>('SENSOR_RESEND_ENABLED', 'false') === 'true';
+    this.resendGraceMs = Number(config.get<string>('RESEND_GRACE_MS', '150'));
+   this.maxResendAttempts = Number(
+  config.get('MAX_RESEND_ATTEMPTS', '0'),
+);
   }
 
   onModuleInit(): void {
     this.sub = this.registry.frames$.subscribe((frame) => {
-      // Never await inside the subscribe callback: RxJS will not wait for it,
-      // and an unhandled rejection here kills the subscription for every lane.
+
       void this.handle(frame);
     });
 
-    // Range-wide admin hold auto-releases the moment live firing resumes —
-    // matches the old backend's sessionStarted/sessionResumed listeners.
-    // Lives here, not in SessionsService, to avoid a module import cycle: see
-    // the comment on SensorGateService in sensor.module.ts.
     this.sessionsSub = this.sessions.events$.subscribe((event) => {
       if (event.type === 'session:started' || event.type === 'session:resumed') {
         this.gate.setHeld(false);
@@ -108,6 +119,7 @@ export class SensorService implements OnModuleInit, OnModuleDestroy {
     this.sessionsSub?.unsubscribe();
     this.shots.complete();
     this.queues.clear();
+    this.clearAllGaps();
   }
 
   private async handle(frame: InBoundFrame): Promise<void> {
@@ -131,19 +143,6 @@ export class SensorService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  // ── Telemetry ──────────────────────────────────────────────────────────────
-
-  /**
-   * Heartbeat. Only proves the board is powered and associated — which is
-   * exactly what the (still to be built) pre-flight check before arming a stage
-   * will read.
-   *
-   * `rssi` is deliberately NOT written yet: the deployed firmware's telemetry
-   * payload layout is unconfirmed (the original backend discarded these frames
-   * outright, so there is no precedent to port). Guessing a byte offset here
-   * would fill the column with plausible-looking garbage, which is worse than
-   * leaving it null. Confirm against the board, then map it here.
-   */
   private async onTelemetry(frame: InBoundFrame): Promise<void> {
     const target = await this.resolver.resolve(frame.sourceKey);
     if (!target) return;
@@ -152,6 +151,292 @@ export class SensorService implements OnModuleInit, OnModuleDestroy {
       where: { id: target.id },
       data: { lastSeenAt: frame.receivedAt },
     });
+  }
+
+
+private scheduleGapResend(target: Target, absolute: number): void {
+  const pending = this.pendingGaps.get(target.id) ?? new Map();
+  this.pendingGaps.set(target.id, pending);
+
+  if (pending.has(absolute)) return;
+
+  const MAX_RETRY_DELAY_MS = 5000;
+  const LOST_TIMEOUT_MS = 60000; // after 60s, mark as lost
+
+  let lostTimer: NodeJS.Timeout;
+
+  const attempt = (attemptsSoFar: number): void => {
+    // Bullet arrived while waiting
+    if (this.sequence.hasSeen(target.id, absolute)) {
+      clearTimeout(lostTimer);
+      this.clearGap(target.id, absolute);
+      return;
+    }
+
+    if (this.maxResendAttempts > 0 && attemptsSoFar >= this.maxResendAttempts) {
+      this.logger.warn(
+        `${target.label}: max resend attempts reached for bullet #${absolute}`,
+      );
+      this.clearGap(target.id, absolute);
+      void this.serializeAndWait(target.id, () => this.publishLost(target, absolute));
+      return;
+    }
+
+    this.logger.warn(
+      `${target.label}: requesting missing bullet #${absolute} ` +
+      `(attempt ${attemptsSoFar + 1})`,
+    );
+
+    void this.targetCommand
+      .resend(this.targetRef(target), absolute & 0xff)
+      .catch((err: Error) =>
+        this.logger.warn(
+          `Resend #${absolute} -> ${target.label} failed: ${err.message}`,
+        ),
+      );
+
+    const entry = pending.get(absolute);
+
+    if (!entry) return;
+
+    entry.attempts = attemptsSoFar + 1;
+
+    // Exponential backoff:
+    // 150ms -> 300ms -> 600ms -> 1200ms -> 2400ms -> 4800ms...
+    const delay = Math.min(
+      this.resendGraceMs * Math.pow(2, attemptsSoFar),
+      MAX_RETRY_DELAY_MS,
+    );
+
+    entry.timer = setTimeout(
+      () => attempt(attemptsSoFar + 1),
+      delay,
+    );
+
+    entry.timer.unref?.();
+  };
+
+
+  // Safety timeout:
+  // If the board truly lost the shot forever, eventually close it.
+  lostTimer = setTimeout(() => {
+    if (this.sequence.hasSeen(target.id, absolute)) {
+      this.clearGap(target.id, absolute);
+      return;
+    }
+
+    this.logger.warn(
+      `${target.label}: bullet #${absolute} missing after ${LOST_TIMEOUT_MS}ms — marking lost.`,
+    );
+
+    this.clearGap(target.id, absolute);
+
+    void this.serializeAndWait(target.id, () =>
+      this.publishLost(target, absolute),
+    );
+
+  }, LOST_TIMEOUT_MS);
+
+  lostTimer.unref?.();
+
+
+  const timer = setTimeout(
+    () => attempt(0),
+    this.resendGraceMs,
+  );
+
+  timer.unref?.();
+
+  pending.set(absolute, {
+    timer,
+    lostTimer,
+    attempts: 0,
+  });
+}
+private serializeAndWait<T>(
+  targetId: string,
+  work: () => Promise<T>,
+): Promise<T> {
+  const tail = this.queues.get(targetId) ?? Promise.resolve();
+
+  const next = tail.then(work);
+
+  this.queues.set(
+    targetId,
+    next.then(
+      () => undefined,
+      () => undefined,
+    ),
+  );
+
+  return next;
+}
+  /** The bullet turned up. Stop chasing it. */
+  private gapArrived(targetId: string, absolute: number): void {
+    const pending = this.pendingGaps.get(targetId);
+    if (!pending?.has(absolute)) return;
+    this.logger.log(
+      `Bullet #${absolute} arrived late on its own — resend cancelled.`,
+    );
+    this.clearGap(targetId, absolute);
+  }
+
+private clearGap(targetId: string, absolute: number): void {
+  const pending = this.pendingGaps.get(targetId);
+  const entry = pending?.get(absolute);
+
+  if (!entry) return;
+
+  clearTimeout(entry.timer);
+  clearTimeout(entry.lostTimer);
+
+  pending!.delete(absolute);
+
+  if (pending!.size === 0) {
+    this.pendingGaps.delete(targetId);
+  }
+}
+  /** Drop every outstanding chase (shutdown). */
+private clearAllGaps(): void {
+  for (const pending of this.pendingGaps.values()) {
+    for (const entry of pending.values()) {
+      clearTimeout(entry.timer);
+      clearTimeout(entry.lostTimer);
+    }
+  }
+
+  this.pendingGaps.clear();
+  this.reservedSlots.clear();
+}
+
+  // ── Lost bullets ───────────────────────────────────────────────────────────
+
+  /**
+   * Write an empty row to hold a missing bullet's place in the stage.
+   *
+   * Deliberately silent: no shot event is emitted here. During the resend grace
+   * window we do not yet know whether this bullet is lost or merely late, and
+   * announcing it would flash a LOST row on every tablet that then has to be
+   * retracted 150ms later. The row exists so the NEXT shot gets the right
+   * number; publishLost announces it only once giving up is final.
+   */
+  private async reserveLostSlot(
+    target: Target,
+    absolute: number,
+    firedAt: Date,
+  ): Promise<void> {
+    const key = slotKey(target.id, absolute);
+    if (this.reservedSlots.has(key)) return;
+
+    const stage = await this.prisma.sessionStage?.findFirst({
+      where: { targetId: target.id, status: 'ACTIVE' },
+      include: { _count: { select: { shots: true } } },
+    });
+    if (!stage) return;
+
+    const shotNumber = stage._count.shots + 1;
+    // A bullet that would have exceeded the stage's allowance is not recorded,
+    // matching what persistHit does with a real one that overruns.
+    if (stage.bulletLimit > 0 && shotNumber > stage.bulletLimit) return;
+
+    await this.prisma.shot?.create({
+      data: {
+        sessionStageId: stage.id,
+        shotNumber,
+        x: 0,
+        y: 0,
+        score: 0,
+        isMiss: true,
+        isLost: true,
+        firedAt,
+      },
+    });
+
+    this.reservedSlots.set(key, { stageId: stage.id, shotNumber });
+
+    this.logger.warn(
+      `${target.label}: reserved shot #${shotNumber} for missing bullet ` +
+        `#${absolute} — placeholder written so later shots keep their numbers.`,
+    );
+  }
+
+  /** Giving up is final: announce the placeholder to connected clients. */
+  private async publishLost(target: Target, absolute: number): Promise<void> {
+    const key = slotKey(target.id, absolute);
+    const slot = this.reservedSlots.get(key);
+    if (!slot) return;
+    this.reservedSlots.delete(key);
+
+    const row = await this.prisma.shot?.findUnique({
+      where: {
+        sessionStageId_shotNumber: {
+          sessionStageId: slot.stageId,
+          shotNumber: slot.shotNumber,
+        },
+      },
+    });
+    // Cleared isLost means the bullet landed after all and persistHit already
+    // announced the real thing; a missing row means the stage was torn down.
+    if (!row?.isLost) return;
+
+    const stage = await this.prisma.sessionStage?.findUnique({
+      where: { id: slot.stageId },
+      include: { _count: { select: { shots: true } } },
+    });
+    if (!stage) return;
+
+    if (stage.bulletLimit > 0 && slot.shotNumber >= stage.bulletLimit) {
+      this.logger.log(
+        `${target.label}: bullet limit ${stage.bulletLimit} reached on a lost ` +
+          `bullet — advancing stage.`,
+      );
+      void this.sessions
+        .advance(stage.sessionId)
+        .catch((err: Error) =>
+          this.logger.error(
+            `Auto-advance after bullet limit failed for session ${stage.sessionId}: ${err.message}`,
+          ),
+        );
+    }
+
+    this.shots.next({
+      laneId: target.laneId,
+      targetId: target.id,
+      targetLabel: target.label,
+      sessionId: stage.sessionId,
+      sessionStageId: stage.id,
+      stageOrder: stage.order,
+      shotNumber: slot.shotNumber,
+      x: 0,
+      y: 0,
+      score: 0,
+      isMiss: true,
+      isLost: true,
+      firedAt: row.firedAt,
+      stageShotCount: stage._count.shots,
+    });
+  }
+
+  private formatFrame(frame: InBoundFrame): string {
+    if (!frame.bytes.length) {
+      return `frame=<synthetic, no wire bytes> cmd=0x${frame.command
+        .toString(16)
+        .padStart(2, '0')} n=${frame.bulletCounter} x=${frame.rawX} y=${frame.rawY}`;
+    }
+
+    const hex = frame.bytes
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join(' ');
+
+    return (
+      `frame=[${hex}] ` +
+      `cmd=0x${frame.command.toString(16).padStart(2, '0')}` +
+      `(${String.fromCharCode(frame.command)}) ` +
+      `n=${frame.bulletCounter} ` +
+      `x=${frame.rawX}(0x${frame.rawX.toString(16).padStart(4, '0')}) ` +
+      `y=${frame.rawY}(0x${frame.rawY.toString(16).padStart(4, '0')}) ` +
+      `from=${frame.sourceKey}`
+    );
   }
 
   // ── Hits ───────────────────────────────────────────────────────────────────
@@ -166,70 +451,56 @@ export class SensorService implements OnModuleInit, OnModuleDestroy {
     );
     if (duplicate) return;
 
-    // Best-effort, deliberately not awaited: a resend request must not delay
-    // persisting the bullet already in hand.
-    if (this.resendEnabled) {
-      for (const gap of gaps) {
-        void this.targetCommand
-          .resend(this.targetRef(target), gap & 0xff)
-          .catch((err: Error) =>
-            this.logger.warn(
-              `Resend ${gap} -> ${target.label} failed: ${err.message}`,
-            ),
-          );
-      }
+    if (this.sequence.hasSeen(target.id, absolute)) {
+      this.gapArrived(target.id, absolute);
     }
+
+
     if (gaps.length > 0) {
       this.logger.warn(
-        `${target.label}: missing bullet(s) ${gaps.join(', ')} before #${absolute}` +
+        `${target.label}: sequence broke — missing #${gaps.join(', #')} before #${absolute}` +
           (this.resendEnabled
-            ? ' — resend requested.'
-            : ' — dropped (resend disabled).'),
+            ? ` — waiting ${this.resendGraceMs}ms for late arrival.`
+            : ' — dropped (resend disabled).') +
+          ` ${this.formatFrame(frame)}`,
       );
-    }
 
-    // An 'L' frame carrying a no-detection sentinel — (0,0) or (65535,65535),
-    // see scoring.ts — means not all the sensors detected the bullet: the board
-    // resolved no location (sensor-values.md). Ask it to re-send so a real
-    // coordinate can come back, same machinery as the gap resend above. The
-    // shot is still scored as a miss regardless, so a board that never recovers
-    // does not lose the round.
-    if (isSentinel(frame.rawX, frame.rawY)) {
-      this.logger.warn(
-        `${target.label}: shot #${absolute} reported no detection (${frame.rawX}, ${frame.rawY}).` +
-          (this.resendEnabled
-            ? ' Requesting resend.'
-            : ' Resend disabled — counted as a miss.'),
-      );
-      if (this.resendEnabled) {
-        void this.targetCommand
-          .resend(this.targetRef(target), frame.bulletCounter)
-          .catch((err: Error) =>
-            this.logger.warn(
-              `Resend ${absolute} -> ${target.label} failed: ${err.message}`,
-            ),
+      if (gaps.length > MAX_PLACEHOLDER_BURST) {
+        // Not a lossy link — a desynced anchor. See MAX_PLACEHOLDER_BURST.
+        this.logger.error(
+          `${target.label}: ${gaps.length} consecutive missing bullets before ` +
+            `#${absolute} — too many to be packet loss, so no placeholders were ` +
+            `written and shot numbering will shift. Check whether the board rebooted ` +
+            `or its bullet counter was reset mid-stage.`,
+        );
+      } else {
+        for (const gap of gaps) {
+          await this.serializeAndWait(target.id, () =>
+            this.reserveLostSlot(target, gap, frame.receivedAt),
           );
+
+          if (this.resendEnabled) {
+            this.scheduleGapResend(target, gap);
+          } else {
+            await this.serializeAndWait(target.id, () => this.publishLost(target, gap));
+          }
+        }
       }
     }
 
-    this.serialize(target.id, () => this.persistHit(target, frame));
+    if (isSentinel(frame.rawX, frame.rawY)) {
+      this.logger.warn(
+        `${target.label}: shot #${absolute} reported no detection (${frame.rawX}, ${frame.rawY}) — ` +
+          `frame arrived intact and in sequence, so this is a board-side ` +
+          `detection failure, not packet loss. Scored as a miss. ` +
+          `${this.formatFrame(frame)}`,
+      );
+    }
+
+    this.serialize(target.id, () => this.persistHit(target, frame, absolute));
   }
 
-  /**
-   * Debug/bench-test injection — ports the old backend's
-   * POST /api/debug/simulate-shot (backend/http/controllers/debug.controller.ts
-   * in the pre-NestJS project). Scores and persists a shot directly against
-   * whatever target is currently armed on `laneId`, identified by the lane
-   * alone. Deliberately skips onHit's IP resolution and sequence-counter
-   * dedup entirely — this is not "pretend to be the sensor board over UDP",
-   * it is "pretend the ingestion pipeline already resolved a target", which
-   * is what lets it work with no target IP configuration at all, exactly
-   * like the old endpoint did.
-   *
-   * `x`/`y` are raw wire-format sensor values (see frame.codec.ts) — the same
-   * shape frontend/src/types/shared/coordinates.ts's clickToSensorCoords
-   * already produces, so a click and this debug path score identically.
-   */
+
   async simulateHit(laneId: number, rawX: number, rawY: number): Promise<ShotEvent> {
     const target = await this.prisma.target.findFirst({
       where: { laneId, stages: { some: { status: 'ACTIVE' } } },
@@ -253,7 +524,7 @@ export class SensorService implements OnModuleInit, OnModuleDestroy {
     };
 
     return new Promise<ShotEvent>((resolve, reject) => {
-      this.serialize(target.id, async () => {
+      void this.serializeAndWait(target.id, async () => {
         try {
           const event = await this.persistHit(target, frame);
           if (!event) {
@@ -272,9 +543,11 @@ export class SensorService implements OnModuleInit, OnModuleDestroy {
     });
   }
 
-  private async persistHit(target: Target, frame: InBoundFrame): Promise<ShotEvent | null> {
-    // Re-read inside the serialised block. A previous bullet in this same queue
-    // may have just completed the stage, and it must not admit another shot.
+  private async persistHit(
+    target: Target,
+    frame: InBoundFrame,
+    absolute?: number,
+  ): Promise<ShotEvent | null> {
     const stage = await this.prisma.sessionStage.findFirst({
       where: { targetId: target.id, status: 'ACTIVE' },
       include: { _count: { select: { shots: true } } },
@@ -282,17 +555,25 @@ export class SensorService implements OnModuleInit, OnModuleDestroy {
 
 
     if (!stage) {
-      // The target fired with nothing armed against it — a dry run, a bump, or
-      // a board still firing after a stage ended. Real, but not attributable.
       this.logger.warn(
         `Unassigned shot from ${target.label}: no active stage on this target.`,
       );
       return null;
     }
 
-    const shotNumber = stage._count.shots + 1;
+    const reservationKey =
+      absolute != null ? slotKey(target.id, absolute) : null;
+    const reservation = reservationKey
+      ? this.reservedSlots.get(reservationKey)
+      : undefined;
+    const filledReservation =
+      reservation?.stageId === stage.id ? reservation : undefined;
 
-    if (stage.bulletLimit > 0 && shotNumber > stage.bulletLimit) {
+    const shotNumber = filledReservation
+      ? filledReservation.shotNumber
+      : stage._count.shots + 1;
+
+    if (!filledReservation && stage.bulletLimit > 0 && shotNumber > stage.bulletLimit) {
       this.logger.warn(
         `${target.label}: shot #${shotNumber} exceeds stage bullet limit ${stage.bulletLimit} — rejected.`,
       );
@@ -304,25 +585,42 @@ export class SensorService implements OnModuleInit, OnModuleDestroy {
       rawY: frame.rawY,
       offsetXmm: target.offsetXmm,
       offsetYmm: target.offsetYmm,
-      // The STAGE's profile snapshot, not target.profileType — re-facing a
-      // target later must not rescore a stage that already happened.
       profile: stage.profileType,
     });
 
-    await this.prisma.shot.create({
-      data: {
+    await this.prisma.shot.upsert({
+      where: {
+        sessionStageId_shotNumber: {
+          sessionStageId: stage.id,
+          shotNumber,
+        },
+      },
+      create: {
         sessionStageId: stage.id,
         shotNumber,
         x: scored.x,
         y: scored.y,
         score: scored.score,
         isMiss: scored.isMiss,
+        isLost: false,
+        firedAt: frame.receivedAt,
+      },
+      update: {
+        x: scored.x,
+        y: scored.y,
+        score: scored.score,
+        isMiss: scored.isMiss,
+        isLost: false,
         firedAt: frame.receivedAt,
       },
     });
 
-    // Announce only AFTER the row is committed. Emitting first would show a
-    // shot on the tablet that a failed write then makes disappear on refresh.
+    if (reservationKey) this.reservedSlots.delete(reservationKey);
+
+    const stageShotCount = filledReservation
+      ? await this.prisma.shot.count({ where: { sessionStageId: stage.id } })
+      : shotNumber;
+
     const event: ShotEvent = {
       laneId: target.laneId,
       targetId: target.id,
@@ -335,19 +633,18 @@ export class SensorService implements OnModuleInit, OnModuleDestroy {
       y: scored.y,
       score: scored.score,
       isMiss: scored.isMiss,
+      isLost: false,
       firedAt: frame.receivedAt,
-      stageShotCount: shotNumber,
+      stageShotCount,
     };
     this.shots.next(event);
 
-    // Reaching the bullet limit ENDS the stage — the previous version only
-    // rejected shot N+1, leaving the stage ACTIVE forever and the target still
-    // armed after the shooter had fired their allotted rounds.
-    //
-    // Not awaited: advance() sends a UDP command and waits on an ack, and this
-    // runs inside the per-target ingest queue. Blocking the queue on a network
-    // handshake would stall every subsequent bullet behind it.
-    if (stage.bulletLimit > 0 && shotNumber >= stage.bulletLimit) {
+
+    if (
+      !filledReservation &&
+      stage.bulletLimit > 0 &&
+      stageShotCount >= stage.bulletLimit
+    ) {
       this.logger.log(
         `${target.label}: bullet limit ${stage.bulletLimit} reached — advancing stage.`,
       );
@@ -363,23 +660,12 @@ export class SensorService implements OnModuleInit, OnModuleDestroy {
     this.logger.log(
       `${target.label} #${shotNumber}: ${
         scored.isMiss ? 'MISS (no detection)' : `(${scored.x}, ${scored.y}) = ${scored.score}`
-      }`,
+      } | ${this.formatFrame(frame)}`,
     );
 
     return event;
   }
 
-  // ── Plumbing ───────────────────────────────────────────────────────────────
-
-  /**
-   * Chain work per target so two bullets can never interleave. The catch is
-   * load-bearing: one unhandled rejection without it poisons the chain and that
-   * target stops ingesting for the rest of the relay.
-   *
-   * Typed to accept any return value, not just Promise<void> — simulateHit's
-   * work settles its own outer promise from inside the callback rather than
-   * through this one's resolution.
-   */
   private serialize(targetId: string, work: () => Promise<unknown>): void {
     const tail = this.queues.get(targetId) ?? Promise.resolve();
     const next = tail
@@ -398,6 +684,8 @@ export class SensorService implements OnModuleInit, OnModuleDestroy {
       label: target.label,
       transport: 'WIFI',
       ipAddress: target.ipAddress,
+      commandHost: target.commandHost,
+      commandPort: target.commandPort,
     };
   }
 }

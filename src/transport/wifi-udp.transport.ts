@@ -106,7 +106,10 @@ export class WifiUdpTransport
   }
 
   async send(target: TargetRef, frame: Buffer): Promise<void> {
-    const host = normalizeIp(target.ipAddress);
+    // Commands go to the override when there is one, and only then. The
+    // fallback is `ipAddress`, which is also what inbound datagrams are
+    // matched on — so a target with no override behaves exactly as before.
+    const host = normalizeIp(target.commandHost) || normalizeIp(target.ipAddress);
     if (!host) {
       throw new Error(
         `Target "${target.label}" (lane ${target.laneId}) has no IP bound. Assign one before arming.`,
@@ -114,8 +117,10 @@ export class WifiUdpTransport
     }
     if (!this.socket) throw new Error("UDP socket not open");
 
+    const port = target.commandPort ?? this.targetPort;
+
     await new Promise<void>((resolve, reject) => {
-      this.socket!.send(frame, this.targetPort, host, (err) =>
+      this.socket!.send(frame, port, host, (err) =>
         err ? reject(err) : resolve(),
       );
     });

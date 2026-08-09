@@ -16,11 +16,13 @@ import type { JwtPayload } from '@/auth/auth.service';
 import { SensorService } from '@/sensor/sensor.service';
 import { SensorGateService } from '@/sensor/sensor-gate.service';
 import { SessionsService } from '@/sessions/sessions.service';
+import { ConnectedShootersService } from '@/auth/connected-shooters.service';
 import { TargetsService } from '@/targets/targets.service';
 import { recentServerLogs, serverLogs$ } from './server-log.stream';
 const ADMIN_ROOM = 'admin';
 /** Per-lane room. A shooter tablet joins exactly one of these. */
 const laneRoom = (laneId: number | string) => `lane:${laneId}`;
+const deviceRoom = (key: string) => `device:${key}`;
 
 interface SocketUser {
   sub: string;
@@ -47,6 +49,7 @@ export class RealtimeGateway
   private targetsSub?: Subscription;
   private gateSub?: Subscription;
   private logsSub?: Subscription;
+  private assignmentsSub?: Subscription;
 
   constructor(
     private readonly sensor: SensorService,
@@ -54,6 +57,7 @@ export class RealtimeGateway
     private readonly sessions: SessionsService,
     private readonly targets: TargetsService,
     private readonly gate: SensorGateService,
+    private readonly connectedShooters: ConnectedShootersService,
   ) { }
 
   onModuleInit(): void {
@@ -72,14 +76,21 @@ export class RealtimeGateway
       this.server.to(ADMIN_ROOM).emit('target:calibrated', event);
     });
 
+    this.assignmentsSub = this.connectedShooters.assignments$.subscribe(
+      (event) => {
+        this.server
+          .to(deviceRoom(event.key))
+          .emit('device:assigned', event);
+        this.server.to(ADMIN_ROOM).emit('device:assigned', event);
+      },
+    );
+
     // Range-wide, not lane-scoped — admin console only, unlike the other three.
     this.gateSub = this.gate.changes$.subscribe((status) => {
       this.server.to(ADMIN_ROOM).emit('sensor:gate', status);
     });
 
-    // The server's own log lines, mirrored into the admin activity log.
-    // NOTHING in this handler may log: it runs on every log line, so a log
-    // here would feed itself forever.
+
     this.logsSub = serverLogs$.subscribe((line) => {
       try {
         this.server?.to(ADMIN_ROOM).emit('server:log', line);
@@ -95,6 +106,7 @@ export class RealtimeGateway
     this.targetsSub?.unsubscribe();
     this.gateSub?.unsubscribe();
     this.logsSub?.unsubscribe();
+    this.assignmentsSub?.unsubscribe();
   }
 
   async handleConnection(client: Socket): Promise<void> {
@@ -175,6 +187,28 @@ export class RealtimeGateway
     this.logger.log(`${user?.username ?? 'anonymous'} joined ${laneRoom(laneId)}`);
 
     return { ok: true, room: laneRoom(laneId) };
+  }
+
+
+  @SubscribeMessage('join-device')
+  async joinDevice(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() body: { key?: string },
+  ): Promise<{ ok: boolean; room?: string; error?: string }> {
+    const key = typeof body?.key === 'string' ? body.key.trim() : '';
+    if (!key) return { ok: false, error: 'key is required' };
+
+    // One device room per socket — rejoining after a reconnect or an IP change
+    // must not leave the socket listening on a stale key as well.
+    for (const room of client.rooms) {
+      if (room !== client.id && room.startsWith('device:')) {
+        await client.leave(room);
+      }
+    }
+
+    await client.join(deviceRoom(key));
+    this.logger.log(`Socket ${client.id} joined ${deviceRoom(key)}`);
+    return { ok: true, room: deviceRoom(key) };
   }
 
   @SubscribeMessage('leave-lane')

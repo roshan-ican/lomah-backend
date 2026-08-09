@@ -84,7 +84,44 @@ export class ReportsService {
     if (!session) {
       throw new NotFoundException(`Session ${id} not found`);
     }
-    return session;
+
+    /**
+     * A FLAT `shots` array alongside the nested stages.
+     *
+     * The session-history preview asks this endpoint for one session and reads
+     * `data.shots` — the shape the old Express backend sent
+     * (`{ session, shots }`). The rewrite returned the raw Prisma row instead,
+     * where shots live at `stages[].shots`, so `data.shots` was undefined and
+     * every expanded session rendered "no shots recorded" over an empty target.
+     *
+     * `shotNumber` is renumbered session-wide here. On the model it is 1-based
+     * PER STAGE, so a two-stage session has two shots numbered 1 — and the
+     * client keys the target board and the shot list off that number, which
+     * would collide. The per-stage value is kept as `stageShotNumber`.
+     */
+    let sequence = 0;
+    const shots = session.stages.flatMap((stage) =>
+      stage.shots.map((shot) => ({
+        id: shot.id,
+        shotNumber: ++sequence,
+        stageShotNumber: shot.shotNumber,
+        sessionStageId: stage.id,
+        stageOrder: stage.order,
+        targetId: stage.targetId,
+        x: shot.x,
+        y: shot.y,
+        score: shot.score,
+        // Read the persisted flag, never `score === 0`: a real hit that landed
+        // outside every scoring ring scores 0 and is NOT a miss. Inferring it
+        // coloured those amber in history and red on the live board.
+        isMiss: shot.isMiss,
+        isLost: shot.isLost,
+        // The client reads `timestamp`; the column is `firedAt`.
+        timestamp: shot.firedAt,
+      })),
+    );
+
+    return { ...session, shots };
   }
 
   async getShooterReport(username: string, from?: string, to?: string) {

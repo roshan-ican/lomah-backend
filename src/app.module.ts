@@ -1,12 +1,13 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { Module } from '@nestjs/common';
+import { Module, type MiddlewareConsumer, type NestModule } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { ScheduleModule } from '@nestjs/schedule';
 import { ServeStaticModule } from '@nestjs/serve-static';
 
 import { PrismaModule } from './common/prisma/prisma.module';
+import { RequestLoggerMiddleware } from './common/request-logger.middleware';
 import { TransportModule } from './transport/transport.module';
 import { TargetsModule } from './targets/targets.module';
 import { AuthModule } from './auth/auth.module';
@@ -63,6 +64,31 @@ function resolveFrontendDist(): string {
     ServeStaticModule.forRoot({
       rootPath: resolveFrontendDist(),
       exclude: ['/api/(.*)', '/health'],
+      serveStaticOptions: {
+        // index.html must NEVER be cached; the hashed bundles it points at
+        // always may be.
+        //
+        // Vite fingerprints every asset (index-CnnciPpu.js) and empties the
+        // output directory on each build, so the filenames are safe to cache
+        // forever — but index.html is the map to them, and it is served with
+        // no cache directive at all by default. A browser is then free to
+        // reuse it heuristically, which on a tablet that loaded the console
+        // hours earlier means a stale index.html paired with the stale
+        // bundles still in its cache: a fully working copy of YESTERDAY'S
+        // app, on a device whose user has no reason to suspect it.
+        //
+        // That is a genuinely hard bug to see from the server, because the
+        // old client behaves plausibly — it just enforces rules that have
+        // since been fixed. Revalidating the entry point on every load costs
+        // one conditional request and removes the whole class.
+        setHeaders: (res, filePath) => {
+          if (filePath.endsWith('index.html')) {
+            res.setHeader('Cache-Control', 'no-cache, must-revalidate');
+          } else if (/\.[0-9a-zA-Z_-]{8,}\.(js|css|woff2?)$/.test(filePath)) {
+            res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+          }
+        },
+      },
     }),
     PrismaModule,
     TransportModule,
@@ -78,4 +104,13 @@ function resolveFrontendDist(): string {
     SystemModule,
   ],
 })
-export class AppModule {}
+export class AppModule implements NestModule {
+  /**
+   * Log every API request. See RequestLoggerMiddleware for why this is not
+   * optional: without it, "the backend has no record of that save" is not a
+   * finding, because the backend had no record of ANY request.
+   */
+  configure(consumer: MiddlewareConsumer): void {
+    consumer.apply(RequestLoggerMiddleware).forRoutes('/api');
+  }
+}

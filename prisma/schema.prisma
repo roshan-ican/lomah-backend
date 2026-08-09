@@ -77,6 +77,17 @@ model Target {
   // implementation — see src/transport/target-transport.interface.ts.)
   ipAddress String @unique
 
+  /// Where PLAY/STOP are unicast when that is not `ipAddress`.
+  ///
+  /// A real board answers from the address it is commanded on, so this stays
+  /// null for range hardware. A simulated or containerised target does not: it
+  /// reports from its bridge IP but is only reachable through a published
+  /// loopback port. Null means "use `ipAddress`".
+  commandHost String?
+
+  /// Port override for command unicasts. Null means the transport default.
+  commandPort Int?
+
   /// Board MAC, learned from telemetry. The stable identity across IP changes.
   deviceId String? @unique
 
@@ -222,7 +233,18 @@ model Shot {
   y Int
 
   score  Int     @default(0)
+
+  /// The board reported this bullet but resolved no coordinates — a sentinel
+  /// (0,0) frame. The datagram ARRIVED; the sensor simply failed to
+  /// triangulate. x/y are meaningless and must not be plotted.
   isMiss Boolean @default(false)
+
+  /// The datagram never arrived. The sequence tracker saw a hole, the resend
+  /// requests went unanswered, and this row exists only to hold the bullet's
+  /// place so shotNumber stays contiguous with what the shooter actually
+  /// fired. Distinct from isMiss on purpose: a MISS storm means go look at the
+  /// board's sensor, a LOST storm means go look at the wifi link.
+  isLost Boolean @default(false)
 
   firedAt DateTime
 

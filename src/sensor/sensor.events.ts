@@ -18,7 +18,11 @@ export interface ShotEvent {
   x: number;
   y: number;
   score: number;
+  /** Sensor fired, resolved nothing. The frame arrived; x/y are meaningless. */
   isMiss: boolean;
+  /** Frame never arrived. Placeholder so the sequence has no hole — see the
+   *  Shot model's isLost. Always implies isMiss, never the other way round. */
+  isLost: boolean;
   firedAt: Date;
   /** Running total for the stage, so clients don't have to accumulate it
    *  themselves — a client that reconnects mid-stage would otherwise start
