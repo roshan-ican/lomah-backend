@@ -106,6 +106,47 @@ describe('scoreShot', () => {
       .toBe(0); // past the silhouette
   });
 
+  it('scores a shot past the silhouette edge as 0, at a radius that would ring', () => {
+    // The live regression: 25M shot #7, frame x=115 y=309 under offset
+    // (+132, +166), scored (247, -25). Radius is 248mm — inside the 300mm
+    // outer band — so it was awarded 2 despite landing 22mm beyond the
+    // right-hand edge of a 450mm-wide face.
+    const shot = scoreShot({
+      rawX: 115,
+      rawY: 309,
+      offsetXmm: 132,
+      offsetYmm: 166,
+      profile: 'FIGURE',
+    });
+    expect(shot.x).toBe(247);
+    expect(shot.y).toBe(-25);
+    expect(shot.score).toBe(0);
+    // Located, just off the board — the shooter is told where it went.
+    expect(shot.isMiss).toBe(false);
+  });
+
+  it('distinguishes a high shot from a wide one at identical radius', () => {
+    // The reason bounds cannot be expressed as a ring: a Figure-11 is 450 wide
+    // and 1000 tall, so 247mm up is comfortably on it and 247mm across is not.
+    const high = scoreShot({ ...base, rawX: 0, rawY: 747, profile: 'FIGURE' });
+    const wide = scoreShot({ ...base, rawX: 247, rawY: 500, profile: 'FIGURE' });
+    expect(high.score).toBe(2);
+    expect(wide.score).toBe(0);
+  });
+
+  it('scores right up to the FIGURE edges and zero just past them', () => {
+    // 450 x 1000 means x is bounded at ±225 and y at ±500 — the same 500 the
+    // floor bias halves.
+    expect(scoreShot({ ...base, rawX: 225, rawY: 500, profile: 'FIGURE' }).score)
+      .toBe(2);
+    expect(scoreShot({ ...base, rawX: 226, rawY: 500, profile: 'FIGURE' }).score)
+      .toBe(0);
+    // Past the last ring but still on the face — zero either way, but for the
+    // ring's reason rather than the bound's.
+    expect(scoreShot({ ...base, rawX: 0, rawY: 1000, profile: 'FIGURE' }).score)
+      .toBe(0);
+  });
+
   it('scores the same coordinates differently per profile', () => {
     const coords = { rawX: 60, rawY: 500, offsetXmm: 0, offsetYmm: 0 };
     const circular = scoreShot({ ...coords, profile: 'CIRCULAR' });

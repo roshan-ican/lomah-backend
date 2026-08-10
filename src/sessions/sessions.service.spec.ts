@@ -66,6 +66,7 @@ function makeService(openSession: Record<string, unknown> | null) {
   const service = new SessionsService(
     prisma as any,
     { play: vi.fn() } as any,
+    { reset: vi.fn() } as any,
     { get: () => 'false' } as any,
   );
   return { service, prisma, tx };

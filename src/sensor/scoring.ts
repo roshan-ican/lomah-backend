@@ -36,6 +36,17 @@ const UINT16_RANGE = 65536;
  */
 export const SENSOR_Y_FLOOR_BIAS_MM = 500;
 
+/**
+ * Millimetres with an explicit sign, for log lines that quote an offset.
+ *
+ * The sign is always shown, including on positives: an offset is a correction
+ * with a direction, and "cal=(66, 93)" read back later is ambiguous about
+ * which way the board was nudged in a way "cal=(+66, +93)" is not.
+ */
+export function signedMm(value: number): string {
+  return `${value > 0 ? '+' : ''}${value}`;
+}
+
 export interface ScoredShot {
   /** Millimetres from centre, signed, calibration applied. */
   x: number;
@@ -45,38 +56,36 @@ export interface ScoredShot {
 }
 
 /**
- * Ring boundaries in millimetres from centre, ascending, paired with the score
- * awarded inside that radius. First match wins; past the last ring is a zero.
+ * Figure-11 scoring boxes, in millimetres from the face centre. Every box is
+ * centred on y = 0; only the half-extents differ.
  *
- * Provisional values — these need confirming against the physical target faces
- * before the system is scored on for real. The STRUCTURE is what matters here;
- * the numbers are a single-line edit once the real face dimensions are known.
+ * The printed Figure-11 face is scored on nested RECTANGLES, not rings. This
+ * previously disagreed with the console, which has always drawn and scored the
+ * rectangular boxes (see `F11_*` in frontend/src/types/shared/coordinates.ts) —
+ * the backend scored the same face radially, with an outermost ring at 300mm
+ * against a silhouette that is 500mm tall. Everything in that 300–500mm band
+ * was painted inside the target by the UI and scored zero by the server, which
+ * is what a bulk calibration surfaced: shots dragged visibly onto the board
+ * came back as zeros. These constants are the console's, and they are the
+ * physical face.
  */
-const RINGS: Record<TargetProfile, ReadonlyArray<readonly [number, number]>> = {
-  // Figure-11 style silhouette. Scored on a coarser band than a circular face.
-  // The face is printed 5/4/3/2 only — there is no 1 zone, so the outermost
-  // ring awards 2 all the way out to the edge of the silhouette and anything
-  // past that is a located zero, not a 1.
-  FIGURE: [
-    [50, 5],
-    [100, 4],
-    [150, 3],
-    [300, 2],
-  ],
-  // Concentric competition face, 10 down to 1.
-  CIRCULAR: [
-    [25, 10],
-    [50, 9],
-    [75, 8],
-    [100, 7],
-    [125, 6],
-    [150, 5],
-    [175, 4],
-    [200, 3],
-    [225, 2],
-    [250, 1],
-  ],
-};
+const F11 = {
+  /** The silhouette itself — 450 x 1000mm. Outside this is a located zero. */
+  silhouette: { halfW: 225, halfH: 500 },
+  center: { halfW: 22.5, halfH: 61.5 },
+  middle: { halfW: 46.5, halfH: 90.5 },
+  outer: { halfW: 82.5, halfH: 181 },
+} as const;
+
+/**
+ * Concentric face: 450mm scoring radius in 45mm bands, 10 down to 1.
+ *
+ * Also taken from the console rather than the old 250mm/25mm table here, for
+ * the same reason as the Figure-11 boxes above — the two had drifted, and the
+ * drawn face is the real one.
+ */
+const CIRCULAR_MAX_MM = 450;
+const CIRCULAR_RING_MM = 45;
 
 /** Reinterpret a big-endian uint16 off the wire as a signed int16. */
 export function toSigned16(raw: number): number {
@@ -88,11 +97,45 @@ export function isSentinel(rawX: number, rawY: number): boolean {
   return SENTINELS.some(([x, y]) => rawX === x && rawY === y);
 }
 
-export function scoreForRadius(radiusMm: number, profile: TargetProfile): number {
-  for (const [limit, score] of RINGS[profile]) {
-    if (radiusMm <= limit) return score;
+/**
+ * Score a coordinate that is ALREADY in face millimetres — signed from the
+ * centre, calibration applied.
+ *
+ * The single scoring authority. Live ingestion reaches it through scoreShot();
+ * the calibration re-score paths (TargetsService.setOffset,
+ * SessionsService.calibrateShot) call it directly, because they are moving
+ * shots that were already located and have no raw frame to re-derive.
+ *
+ * Face bounds are checked HERE rather than by the caller. The previous split —
+ * an `isOnFace` guard wrapped around a radius lookup — was only ever applied on
+ * the ingestion path, so a shot dragged off the edge of the silhouette scored
+ * from the ring table while the identical coordinate scored zero when fired.
+ * Folding the bound into the score makes that divergence unrepresentable.
+ */
+export function scoreAt(
+  xMm: number,
+  yMm: number,
+  profile: TargetProfile,
+): number {
+  if (profile === 'CIRCULAR') {
+    const r = Math.hypot(xMm, yMm);
+    if (r > CIRCULAR_MAX_MM) return 0;
+    return Math.max(1, Math.ceil(10 - r / CIRCULAR_RING_MM));
   }
-  return 0;
+
+  const ax = Math.abs(xMm);
+  const ay = Math.abs(yMm);
+
+  // Off the paper entirely.
+  if (ax > F11.silhouette.halfW || ay > F11.silhouette.halfH) return 0;
+
+  if (ax <= F11.center.halfW && ay <= F11.center.halfH) return 5;
+  if (ax <= F11.middle.halfW && ay <= F11.middle.halfH) return 4;
+  if (ax <= F11.outer.halfW && ay <= F11.outer.halfH) return 3;
+
+  // On the silhouette but outside every printed box. The face prints 5/4/3/2
+  // with no 1 zone, so this is a 2 all the way to the edge.
+  return 2;
 }
 
 /**
@@ -105,7 +148,7 @@ export function scoreForRadius(radiusMm: number, profile: TargetProfile): number
  *      every Y is shifted down by SENSOR_Y_FLOOR_BIAS_MM (500mm) to centre it
  *   4. calibration offset — mounting error belongs to the hardware, so it is
  *      applied before scoring, never stored raw and corrected at read time
- *   5. radius -> score, against the profile the CALLER passes in
+ *   5. scoreAt — face bounds and zone, against the profile the CALLER passes in
  *
  * `profile` is the stage's snapshot, not the target's current face. Re-facing a
  * target must not retroactively rescore a stage that already happened.
@@ -126,10 +169,15 @@ export function scoreShot(params: {
   const x = toSigned16(rawX) + offsetXmm;
   const y = toSigned16(rawY) - SENSOR_Y_FLOOR_BIAS_MM + offsetYmm;
 
-  const radius = Math.hypot(x, y);
-  const score = scoreForRadius(radius, profile);
-
-  // Outside the last ring is a real, located shot that simply scored nothing —
-  // distinct from a sentinel miss, where there are no coordinates at all.
-  return { x: Math.round(x), y: Math.round(y), score, isMiss: false };
+  // A shot off the face scores zero but is NOT a miss: the sensor located this
+  // bullet, and the coordinates are real and worth keeping — the shooter can
+  // see they went wide right rather than being told nothing was detected.
+  // isMiss is reserved for the sentinel case, where there are no coordinates
+  // at all.
+  return {
+    x: Math.round(x),
+    y: Math.round(y),
+    score: scoreAt(x, y, profile),
+    isMiss: false,
+  };
 }

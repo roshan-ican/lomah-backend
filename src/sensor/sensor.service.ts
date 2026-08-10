@@ -21,7 +21,13 @@ import { TransportRegistry } from '@/transport/transport.registry';
 
 import { SessionsService } from '@/sessions/sessions.service';
 
-import { scoreShot, isSentinel } from './scoring';
+import {
+  scoreShot,
+  isSentinel,
+  signedMm,
+  toSigned16,
+  SENSOR_Y_FLOOR_BIAS_MM,
+} from './scoring';
 import type { ShotEvent } from './sensor.events';
 import { TargetResolver } from './target-resolver.service';
 import { SensorGateService } from './sensor-gate.service';
@@ -102,6 +108,14 @@ export class SensorService implements OnModuleInit, OnModuleDestroy {
   }
 
   onModuleInit(): void {
+    // The one step in raw -> scored that is not visible on a shot line. The
+    // per-shot log prints raw() already biased, so without this the constant
+    // that produced it is invisible to anyone reading the log later.
+    this.logger.log(
+      `Shot geometry: raw = signed16(wire) with Y floor bias ` +
+        `${SENSOR_Y_FLOOR_BIAS_MM}mm subtracted; scored = raw + per-target cal.`,
+    );
+
     this.sub = this.registry.frames$.subscribe((frame) => {
 
       void this.handle(frame);
@@ -110,6 +124,19 @@ export class SensorService implements OnModuleInit, OnModuleDestroy {
     this.sessionsSub = this.sessions.events$.subscribe((event) => {
       if (event.type === 'session:started' || event.type === 'session:resumed') {
         this.gate.setHeld(false);
+      }
+
+      // Anything that arms a board starts a new relay on it, so whatever this
+      // service was still chasing for that target belongs to the previous one.
+      // SessionsService resets the SequenceTracker at the same moments; this is
+      // the other half, and it cannot live there — SensorModule imports
+      // SessionsModule, so the dependency only runs this way round.
+      if (
+        event.type === 'session:started' ||
+        event.type === 'session:resumed' ||
+        event.type === 'session:advanced'
+      ) {
+        if (event.targetId) this.resetTarget(event.targetId);
       }
     });
   }
@@ -296,6 +323,38 @@ private clearGap(targetId: string, absolute: number): void {
     this.pendingGaps.delete(targetId);
   }
 }
+  /**
+   * Drop everything this service is still chasing for one target.
+   *
+   * Called when a board is (re)armed for a new relay. The timers are the point:
+   * a gap chase runs for up to LOST_TIMEOUT_MS (60s) and keeps asking the board
+   * to resend bullet numbers from the PREVIOUS session, which is how a
+   * five-shot relay ended up logging "requesting missing bullet #21". The
+   * reserved slots go with them — they name rows in a stage that is over, so a
+   * late frame must not be allowed to fill one.
+   */
+  resetTarget(targetId: string): void {
+    const pending = this.pendingGaps.get(targetId);
+    if (pending) {
+      for (const entry of pending.values()) {
+        clearTimeout(entry.timer);
+        clearTimeout(entry.lostTimer);
+      }
+      this.pendingGaps.delete(targetId);
+    }
+
+    const prefix = `${targetId}:`;
+    for (const key of this.reservedSlots.keys()) {
+      if (key.startsWith(prefix)) this.reservedSlots.delete(key);
+    }
+
+    if (pending?.size) {
+      this.logger.log(
+        `Dropped ${pending.size} outstanding bullet chase(s) for ${targetId} — new relay armed.`,
+      );
+    }
+  }
+
   /** Drop every outstanding chase (shutdown). */
 private clearAllGaps(): void {
   for (const pending of this.pendingGaps.values()) {
@@ -657,10 +716,34 @@ private clearAllGaps(): void {
         );
     }
 
+    // The whole arithmetic is printed on every located shot, not just the
+    // result and not just on the line where the calibration changed. Reading a
+    // scored coordinate back to its raw frame otherwise means sign-correcting
+    // the wire bytes by hand, remembering the Y floor bias, and finding the
+    // last CALIBRATED line — which may be in an earlier session, or in a log
+    // that has already rolled. A shot whose offset cannot be reconstructed
+    // cannot be argued with afterwards, so the line shows what the sensor
+    // gave, what was added to it, and what that produced:
+    //
+    //   25M #2: raw(-269, 309) + cal(+278, -750)mm = (9, -441) = 0
+    //
+    // raw() is post-sign-correction and post-Y-floor-bias — i.e. millimetres
+    // from centre as the sensor saw them, the exact quantity the offset is
+    // added to. cal(none) is printed rather than omitted so that calibrated
+    // and uncalibrated shots line up column-wise and grep the same way.
+    // Omitted entirely on a miss: there are no coordinates for it to explain.
+    const geometry = scored.isMiss
+      ? 'MISS (no detection)'
+      : `raw(${toSigned16(frame.rawX)}, ${
+          toSigned16(frame.rawY) - SENSOR_Y_FLOOR_BIAS_MM
+        }) + ${
+          target.offsetXmm === 0 && target.offsetYmm === 0
+            ? 'cal(none)'
+            : `cal(${signedMm(target.offsetXmm)}, ${signedMm(target.offsetYmm)})mm`
+        } = (${scored.x}, ${scored.y}) = ${scored.score}`;
+
     this.logger.log(
-      `${target.label} #${shotNumber}: ${
-        scored.isMiss ? 'MISS (no detection)' : `(${scored.x}, ${scored.y}) = ${scored.score}`
-      } | ${this.formatFrame(frame)}`,
+      `${target.label} #${shotNumber}: ${geometry} | ${this.formatFrame(frame)}`,
     );
 
     return event;

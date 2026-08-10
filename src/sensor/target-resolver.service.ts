@@ -54,10 +54,15 @@ export class TargetResolver {
   }
 
   /**
-   * Drop cached entries. Must be called whenever a target's ipAddress changes
-   * or a target is deleted, otherwise frames keep resolving to a stale row —
-   * the failure mode being shots attributed to the wrong target after a board
-   * swap, which is silent and unrecoverable after the fact.
+   * Drop cached entries. Must be called whenever ANY column on the cached row
+   * changes, not just ipAddress — the whole Target is cached, and the scoring
+   * path reads offsetXmm/offsetYmm straight off it. Two silent failure modes,
+   * both unrecoverable after the relay:
+   *
+   *   - stale ipAddress -> shots attributed to the wrong target after a board
+   *     swap
+   *   - stale offsets   -> bullets fired after a mid-stage calibration scored
+   *     against the pre-calibration mounting error
    */
   invalidate(sourceKey?: string): void {
     if (sourceKey) {

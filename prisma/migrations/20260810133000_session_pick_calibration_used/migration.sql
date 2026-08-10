@@ -1,0 +1,12 @@
+-- The one-bullet "pick" calibration is spendable exactly once per session.
+--
+-- Was inferred from calibrationCount === 0, which is wrong in both directions:
+-- a reset-to-zero performed before any calibration consumed the pick, and the
+-- count says nothing about WHICH kind of calibration was performed. This flag
+-- is written only by calibrate-from-shot.
+--
+-- Existing rows default to false, so any session already in flight is offered
+-- its pick once. That is the safe direction: withholding it from a session
+-- that never used it would leave the operator with no way to set an initial
+-- reference at all.
+ALTER TABLE "sessions" ADD COLUMN "pickCalibrationUsed" BOOLEAN NOT NULL DEFAULT false;

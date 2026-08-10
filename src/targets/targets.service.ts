@@ -16,7 +16,7 @@ import { TargetResolver } from '@/sensor/target-resolver.service';
 import { TargetCommandService } from '@/transport/target-command.service';
 import { SequenceTracker } from '@/transport/protocol/sequence.tracker';
 import type { WiperPage } from '@/transport/protocol/frame.codec';
-import { scoreForRadius } from '@/sensor/scoring';
+import { scoreAt, signedMm } from '@/sensor/scoring';
 import type { TargetCalibratedEvent } from './target.events';
 
 /** Prisma's code for "a unique constraint was violated". */
@@ -451,7 +451,19 @@ export class TargetsService implements OnModuleDestroy {
     };
   }
 
-  async setOffset(id: string, offsetXmm: number, offsetYmm: number) {
+  /**
+   * @param marksPickUsed true only when this write came from
+   *   calibrateFromShot — the one-bullet pick. Every other route into here (a
+   *   bulk group drag, a hand-typed offset, a reset to zero) leaves the pick
+   *   flag alone: see Session.pickCalibrationUsed for why it is not inferred
+   *   from the calibration count.
+   */
+  async setOffset(
+    id: string,
+    offsetXmm: number,
+    offsetYmm: number,
+    marksPickUsed = false,
+  ) {
     const target = await this.findOne(id);
     const deltaX = offsetXmm - target.offsetXmm;
     const deltaY = offsetYmm - target.offsetYmm;
@@ -461,6 +473,26 @@ export class TargetsService implements OnModuleDestroy {
       include: { shots: true },
     });
 
+    // Every stage of the SAME SESSION, not just the live one.
+    //
+    // A calibration corrects a mounting error that was wrong for the whole
+    // relay, so applying it to only the active stage leaves the earlier stages
+    // of that session scored against an offset the operator has just declared
+    // incorrect — and the session total then disagrees with the sum of the
+    // shots it is made of. Scoped to the session on purpose: widening it to
+    // every stage this target ever ran would retroactively rewrite sessions
+    // that are already completed and reviewed.
+    const stagesToRescore = activeStage
+      ? await this.prisma.sessionStage.findMany({
+          where: { sessionId: activeStage.sessionId, targetId: id },
+          include: { shots: true },
+        })
+      : [];
+
+    // Collected inside the transaction, logged after it commits — a re-score
+    // that rolled back must not leave a log line claiming it happened.
+    const rescored: string[] = [];
+
     await this.prisma.$transaction(async (tx) => {
       await tx.target.update({
         where: { id },
@@ -469,17 +501,62 @@ export class TargetsService implements OnModuleDestroy {
 
       if (!activeStage) return;
 
-      for (const shot of activeStage.shots) {
-        if (shot.isMiss) continue;
+      // Recorded here, in the same transaction as the offset itself, so
+      // neither fact can disagree with whether the calibration actually
+      // landed. The flag is one-way: `true` is never written back to false
+      // within a session, so resetting the offset cannot hand the pick back.
+      await tx.session.update({
+        where: { id: activeStage.sessionId },
+        data: {
+          calibrationCount: { increment: 1 },
+          ...(marksPickUsed ? { pickCalibrationUsed: true } : {}),
+        },
+      });
 
-        const x = shot.x + deltaX;
-        const y = shot.y + deltaY;
-        const score = scoreForRadius(Math.hypot(x, y), activeStage.profileType);
-        await tx.shot.update({ where: { id: shot.id }, data: { x, y, score } });
+      for (const stage of stagesToRescore) {
+        for (const shot of stage.shots) {
+          if (shot.isMiss) continue;
+
+          const x = shot.x + deltaX;
+          const y = shot.y + deltaY;
+          // Each stage's OWN profile snapshot — a session can mix faces, and a
+          // stage must never be re-scored against a face it was not shot on.
+          const score = scoreAt(x, y, stage.profileType);
+          await tx.shot.update({ where: { id: shot.id }, data: { x, y, score } });
+          rescored.push(
+            `stage ${stage.order} #${shot.shotNumber}: ` +
+              `(${shot.x}, ${shot.y}) = ${shot.score} -> ` +
+              `(${x}, ${y}) = ${score}`,
+          );
+        }
       }
     });
 
-    const shotsUpdated = activeStage?.shots.filter((s) => !s.isMiss).length ?? 0;
+    const shotsUpdated = rescored.length;
+
+    for (const line of rescored) {
+      this.logger.log(`RE-SCORED ${target.label} ${line}`);
+    }
+
+    this.resolver.invalidate(target.ipAddress);
+
+    const appliesFrom = activeStage
+      ? `in force from shot #${activeStage.shots.length + 1}`
+      : 'no active stage — in force from the next stage';
+    this.logger.log(
+      `CALIBRATED ${target.label}: offset ` +
+        `(${signedMm(target.offsetXmm)}, ${signedMm(target.offsetYmm)}) -> ` +
+        `(${signedMm(offsetXmm)}, ${signedMm(offsetYmm)})mm ` +
+        `[delta ${signedMm(deltaX)}, ${signedMm(deltaY)}] — ` +
+        `${shotsUpdated} shot(s) re-scored, ${appliesFrom}.`,
+    );
+
+    const session = activeStage
+      ? await this.prisma.session.findUnique({
+          where: { id: activeStage.sessionId },
+          select: { calibrationCount: true, pickCalibrationUsed: true },
+        })
+      : null;
 
     this.calibrations.next({
       laneId: target.laneId,
@@ -487,6 +564,8 @@ export class TargetsService implements OnModuleDestroy {
       offsetXmm,
       offsetYmm,
       shotsUpdated,
+      sessionCalibrationCount: session?.calibrationCount ?? null,
+      sessionPickUsed: session?.pickCalibrationUsed ?? null,
     });
 
     return this.findOne(id);
@@ -504,7 +583,14 @@ export class TargetsService implements OnModuleDestroy {
     const offsetXmm = target.offsetXmm + (trueX - shot.x);
     const offsetYmm = target.offsetYmm + (trueY - shot.y);
 
-    return this.setOffset(id, offsetXmm, offsetYmm);
+    this.logger.log(
+      `CALIBRATE FROM SHOT: ${target.label} shot #${shot.shotNumber} ` +
+        `scored at (${shot.x}, ${shot.y}) -> operator marked true position ` +
+        `(${trueX}, ${trueY})mm.`,
+    );
+
+    // The only caller that spends the session's one-bullet pick.
+    return this.setOffset(id, offsetXmm, offsetYmm, true);
   }
 
   /**
