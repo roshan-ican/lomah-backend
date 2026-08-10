@@ -13,6 +13,7 @@ import { PrismaService } from '@/common/prisma/prisma.service';
 import {
   CMD_HIT,
   CMD_TELEMETRY,
+  ECHO_WINDOW_MS,
 } from '@/transport/protocol/frame.codec';
 import { SequenceTracker } from '@/transport/protocol/sequence.tracker';
 import { TargetCommandService } from '@/transport/target-command.service';
@@ -44,10 +45,84 @@ import { SensorGateService } from './sensor-gate.service';
  */
 const MAX_PLACEHOLDER_BURST = 8;
 
-/** Where a reserved-but-unfilled bullet is parked, pending resend. */
-interface ReservedSlot {
+// ECHO_WINDOW_MS — how soon an identical (0,0) frame for the bullet we just
+// asked about counts as our own request bouncing back rather than an answer —
+// now lives in frame.codec.ts beside buildReadShotFrame. TargetsService.readShot
+// has to make the same judgement on the commissioning route, and while this
+// constant was local the two surfaces disagreed: the route compared bytes only,
+// so every honest "no position for that shot" reply was reported as
+// "read not implemented".
+
+/**
+ * Most no-detection shots chased at once per target.
+ *
+ * A no-detection storm produces one candidate per shot, on the hot receive path
+ * during sustained fire — the exact regression gap-resend.spec.ts was written
+ * to prevent. Past this many in flight, later misses are painted immediately
+ * and not chased.
+ */
+const MAX_CONCURRENT_NODETECT_READS = 4;
+
+/**
+ * Longest a board has been measured taking to answer a read-shot request.
+ *
+ * The dev board answers in 700–820ms over the direct AP link (timed off field
+ * logs: request at 26.768 answered at 27.489, request at 31.483 answered at
+ * 32.302). Reading a stored shot costs it a lookup; this is not link latency,
+ * and no amount of asking harder shortens it.
+ *
+ * It is a floor on two settings, enforced below, because both were configured
+ * shorter than it and both failed silently as a result:
+ *
+ *   RESEND_GRACE_MS   — was 250ms, so a chase fired four requests before the
+ *                       first answer could physically arrive. The board serviced
+ *                       one and dropped the rest, which read as "the board is
+ *                       ignoring us" when it was simply being asked 3x too fast.
+ *   NO_DETECT_HOLD_MS — was 800ms, so the UI gave up and painted a MISS a
+ *                       moment before the answer landed, which is the exact
+ *                       flicker the hold exists to prevent.
+ */
+const BOARD_READ_LATENCY_MS = 900;
+
+/** How many bullets back a target's slot mapping is retained. Mirrors
+ *  SEEN_WINDOW in sequence.tracker.ts — past it, the tracker calls a late
+ *  bullet a fresh one anyway, so its row mapping is dead weight. */
+const SLOT_WINDOW = 128;
+
+/** Which row in which stage a given bullet number owns. */
+interface ShotSlot {
   stageId: string;
   shotNumber: number;
+  /** Set once publishLost has announced this row, so giving up twice on the
+   *  same bullet cannot emit it twice. Used to be implicit in deleting the
+   *  entry, which is no longer safe — the mapping has to outlive the giving up
+   *  so a very late bullet still fills its own row. */
+  announcedLost?: boolean;
+}
+
+/** Whether we are chasing a bullet that never arrived, or one that arrived
+ *  carrying nothing. The two differ in how giving up is reported. */
+type ReadKind = 'gap' | 'nodetect';
+
+interface PendingRead {
+  kind: ReadKind;
+  timer: NodeJS.Timeout;
+  /** 'gap' only — the 60s backstop that finalises a bullet as lost. */
+  lostTimer: NodeJS.Timeout | null;
+  /** 'nodetect' only — when the UI stops waiting and paints the miss. */
+  holdTimer: NodeJS.Timeout | null;
+  attempts: number;
+  /** Epoch ms of the last request we put on the wire, for ECHO_WINDOW_MS. */
+  lastSentAt: number;
+}
+
+/** A shot persisted but not yet announced, waiting on a read-shot reply. */
+interface HeldShot {
+  event: ShotEvent;
+  /** Session to advance when this event is finally released, if this shot
+   *  completed the stage. Deferred with the event — a stage must not advance
+   *  on a shot the shooter has not been shown. */
+  advanceSessionId: string | null;
 }
 
 function slotKey(targetId: string, absolute: number): string {
@@ -72,23 +147,29 @@ export class SensorService implements OnModuleInit, OnModuleDestroy {
 
   private readonly maxResendAttempts: number;
 
+  private readonly noDetectReread: boolean;
 
-  private readonly pendingGaps = new Map<
-    string,
-    Map<number, { timer: NodeJS.Timeout; lostTimer: NodeJS.Timeout; attempts: number }>
-  >();
+  private readonly noDetectHoldMs: number;
+
+  /** targetId -> absolute -> the chase currently running for that bullet. */
+  private readonly pendingReads = new Map<string, Map<number, PendingRead>>();
 
   /**
-   * Placeholder rows written for holes we are still chasing, keyed
-   * `${targetId}:${absolute}`.
+   * Which row each bullet number owns, keyed `${targetId}:${absolute}`.
    *
    * Exists because shotNumber is stage-relative ("rows so far + 1") while the
    * sequence tracker counts board-lifetime bullets, so there is no arithmetic
-   * that maps one onto the other. The slot is recorded at reserve time and
-   * looked up again if the bullet lands late, which is what lets a resend fill
-   * its own row rather than take a fresh number at the end of the list.
+   * that maps one onto the other. The entry is recorded when the row is written
+   * — reserved placeholder or real shot alike — and looked up again whenever
+   * that bullet number turns up later, which is what lets both a late bullet
+   * and a re-read correction land in their own row rather than take a fresh
+   * number at the end of the list.
    */
-  private readonly reservedSlots = new Map<string, ReservedSlot>();
+  private readonly slots = new Map<string, ShotSlot>();
+
+  /** Shots written to the database but deliberately not announced yet, keyed
+   *  the same way. See beginNoDetectHold. */
+  private readonly heldShots = new Map<string, HeldShot>();
 
   constructor(
     private readonly prisma: PrismaService,
@@ -101,10 +182,45 @@ export class SensorService implements OnModuleInit, OnModuleDestroy {
     config: ConfigService,
   ) {
     this.resendEnabled = config.get<string>('SENSOR_RESEND_ENABLED', 'false') === 'true';
-    this.resendGraceMs = Number(config.get<string>('RESEND_GRACE_MS', '150'));
-   this.maxResendAttempts = Number(
-  config.get('MAX_RESEND_ATTEMPTS', '0'),
-);
+    this.maxResendAttempts = Number(config.get('MAX_RESEND_ATTEMPTS', '4'));
+    this.noDetectReread = config.get<string>('NO_DETECT_REREAD', 'false') === 'true';
+
+    // Clamped rather than trusted. Both of these are millisecond knobs whose
+    // wrong values produce no error and no obviously broken behaviour — just a
+    // board that appears not to answer and shots that flicker from miss to hit.
+    // See BOARD_READ_LATENCY_MS; anything below it is a misconfiguration, so it
+    // is corrected loudly at startup instead of being honoured quietly.
+    //
+    // The floor is itself configurable, and set to 0 by the specs: they drive
+    // whole chases through fake timers on a 60ms grace, so a hard-coded 900ms
+    // floor would stretch every timeline in the suite by 15x for no gain. It is
+    // a guard against a mistyped .env, not an invariant of the algorithm.
+    const floorMs = Number(
+      config.get<string>('BOARD_READ_LATENCY_MS', String(BOARD_READ_LATENCY_MS)),
+    );
+
+    this.resendGraceMs = this.atLeast(
+      Number(config.get<string>('RESEND_GRACE_MS', '1000')),
+      floorMs,
+      'RESEND_GRACE_MS',
+    );
+    this.noDetectHoldMs = this.atLeast(
+      Number(config.get<string>('NO_DETECT_HOLD_MS', '2000')),
+      floorMs,
+      'NO_DETECT_HOLD_MS',
+    );
+  }
+
+  private atLeast(value: number, floorMs: number, name: string): number {
+    if (!Number.isFinite(floorMs) || floorMs <= 0) return value;
+    if (Number.isFinite(value) && value >= floorMs) return value;
+    this.logger.warn(
+      `${name}=${value}ms is below the ${floorMs}ms a board needs to answer a ` +
+        `read — raising it to ${floorMs}ms. Below this, requests go out faster ` +
+        `than they can be answered, the board drops the ones it cannot service, ` +
+        `and it looks unresponsive when it is not.`,
+    );
+    return floorMs;
   }
 
   onModuleInit(): void {
@@ -146,7 +262,7 @@ export class SensorService implements OnModuleInit, OnModuleDestroy {
     this.sessionsSub?.unsubscribe();
     this.shots.complete();
     this.queues.clear();
-    this.clearAllGaps();
+    this.clearAllReads();
   }
 
   private async handle(frame: InBoundFrame): Promise<void> {
@@ -181,103 +297,131 @@ export class SensorService implements OnModuleInit, OnModuleDestroy {
   }
 
 
-private scheduleGapResend(target: Target, absolute: number): void {
-  const pending = this.pendingGaps.get(target.id) ?? new Map();
-  this.pendingGaps.set(target.id, pending);
+/**
+ * Start asking the board for one bullet, over 'L'.
+ *
+ * Two callers, distinguished by `kind`:
+ *   'gap'      — the bullet's datagram never arrived. Give up by announcing the
+ *                placeholder row as LOST.
+ *   'nodetect' — the bullet arrived as (0,0). Its row is already written and
+ *                held back from the UI; give up by painting it as a MISS.
+ */
+private scheduleRead(target: Target, absolute: number, kind: ReadKind): void {
+  const pending = this.pendingReads.get(target.id) ?? new Map<number, PendingRead>();
+  this.pendingReads.set(target.id, pending);
 
   if (pending.has(absolute)) return;
+
+  if (kind === 'nodetect') {
+    let inFlight = 0;
+    for (const entry of pending.values()) if (entry.kind === 'nodetect') inFlight++;
+    if (inFlight >= MAX_CONCURRENT_NODETECT_READS) {
+      this.logger.warn(
+        `${target.label}: ${inFlight} no-detection re-reads already in flight — ` +
+          `shot #${absolute} scored as a miss without asking. The board is failing ` +
+          `to triangulate faster than it can answer; check sensitivity, not the link.`,
+      );
+      this.releaseHeld(target.id, absolute);
+      return;
+    }
+  }
 
   const MAX_RETRY_DELAY_MS = 5000;
   const LOST_TIMEOUT_MS = 60000; // after 60s, mark as lost
 
-  let lostTimer: NodeJS.Timeout;
+  const giveUp = (why: string): void => {
+    this.logger.warn(`${target.label}: ${why} for bullet #${absolute}`);
+    this.clearRead(target.id, absolute);
+    if (kind === 'gap') {
+      void this.serializeAndWait(target.id, () => this.publishLost(target, absolute));
+    } else {
+      this.releaseHeld(target.id, absolute);
+    }
+  };
 
   const attempt = (attemptsSoFar: number): void => {
-    // Bullet arrived while waiting
-    if (this.sequence.hasSeen(target.id, absolute)) {
-      clearTimeout(lostTimer);
-      this.clearGap(target.id, absolute);
+    // A 'gap' bullet that turned up on its own needs no more asking. A
+    // 'nodetect' one cannot be settled this way — the tracker recorded its
+    // counter when the (0,0) arrived, so hasSeen was already true before the
+    // chase started. Its exit is onReadReply or the give-up below.
+    if (kind === 'gap' && this.sequence.hasSeen(target.id, absolute)) {
+      this.clearRead(target.id, absolute);
       return;
     }
 
     if (this.maxResendAttempts > 0 && attemptsSoFar >= this.maxResendAttempts) {
-      this.logger.warn(
-        `${target.label}: max resend attempts reached for bullet #${absolute}`,
-      );
-      this.clearGap(target.id, absolute);
-      void this.serializeAndWait(target.id, () => this.publishLost(target, absolute));
+      giveUp('max read attempts reached');
       return;
     }
 
+    const entry = pending.get(absolute);
+    if (!entry) return;
+
     this.logger.warn(
-      `${target.label}: requesting missing bullet #${absolute} ` +
-      `(attempt ${attemptsSoFar + 1})`,
+      `${target.label}: requesting ${kind === 'gap' ? 'missing' : 'no-detection'} ` +
+        `bullet #${absolute} (attempt ${attemptsSoFar + 1})`,
     );
 
+    entry.attempts = attemptsSoFar + 1;
+    // Stamped before the await, not after: the echo we are guarding against can
+    // be back inside a millisecond on a direct AP link.
+    entry.lastSentAt = Date.now();
+
     void this.targetCommand
-      .resend(this.targetRef(target), absolute & 0xff)
+      .readShotRequest(this.targetRef(target), absolute & 0xff)
       .catch((err: Error) =>
         this.logger.warn(
-          `Resend #${absolute} -> ${target.label} failed: ${err.message}`,
+          `Read shot #${absolute} -> ${target.label} failed: ${err.message}`,
         ),
       );
 
-    const entry = pending.get(absolute);
-
-    if (!entry) return;
-
-    entry.attempts = attemptsSoFar + 1;
-
     // Exponential backoff:
-    // 150ms -> 300ms -> 600ms -> 1200ms -> 2400ms -> 4800ms...
+    // 250ms -> 500ms -> 1000ms -> 2000ms -> 4000ms -> 5000ms...
     const delay = Math.min(
       this.resendGraceMs * Math.pow(2, attemptsSoFar),
       MAX_RETRY_DELAY_MS,
     );
 
-    entry.timer = setTimeout(
-      () => attempt(attemptsSoFar + 1),
-      delay,
-    );
-
+    entry.timer = setTimeout(() => attempt(attemptsSoFar + 1), delay);
     entry.timer.unref?.();
   };
 
+  // Safety timeout: if the board truly lost the shot forever, eventually close
+  // it. Only meaningful for a gap — a no-detection row already exists and is
+  // closed by its hold timer instead.
+  let lostTimer: NodeJS.Timeout | null = null;
+  if (kind === 'gap') {
+    lostTimer = setTimeout(() => {
+      if (this.sequence.hasSeen(target.id, absolute)) {
+        this.clearRead(target.id, absolute);
+        return;
+      }
+      giveUp(`missing after ${LOST_TIMEOUT_MS}ms — marking lost`);
+    }, LOST_TIMEOUT_MS);
+    lostTimer.unref?.();
+  }
 
-  // Safety timeout:
-  // If the board truly lost the shot forever, eventually close it.
-  lostTimer = setTimeout(() => {
-    if (this.sequence.hasSeen(target.id, absolute)) {
-      this.clearGap(target.id, absolute);
-      return;
-    }
+  // The UI's patience, which is deliberately shorter than the chase. If the
+  // board answers late the correction still lands — persistHit upserts the same
+  // row and re-announces it, and the client replaces the miss in place.
+  let holdTimer: NodeJS.Timeout | null = null;
+  if (kind === 'nodetect') {
+    holdTimer = setTimeout(() => {
+      this.releaseHeld(target.id, absolute);
+    }, this.noDetectHoldMs);
+    holdTimer.unref?.();
+  }
 
-    this.logger.warn(
-      `${target.label}: bullet #${absolute} missing after ${LOST_TIMEOUT_MS}ms — marking lost.`,
-    );
-
-    this.clearGap(target.id, absolute);
-
-    void this.serializeAndWait(target.id, () =>
-      this.publishLost(target, absolute),
-    );
-
-  }, LOST_TIMEOUT_MS);
-
-  lostTimer.unref?.();
-
-
-  const timer = setTimeout(
-    () => attempt(0),
-    this.resendGraceMs,
-  );
-
+  const timer = setTimeout(() => attempt(0), this.resendGraceMs);
   timer.unref?.();
 
   pending.set(absolute, {
+    kind,
     timer,
     lostTimer,
+    holdTimer,
     attempts: 0,
+    lastSentAt: 0,
   });
 }
 private serializeAndWait<T>(
@@ -298,31 +442,89 @@ private serializeAndWait<T>(
 
   return next;
 }
-  /** The bullet turned up. Stop chasing it. */
-  private gapArrived(targetId: string, absolute: number): void {
-    const pending = this.pendingGaps.get(targetId);
+  /**
+   * The bullet turned up. Stop chasing it.
+   *
+   * The log line used to say "arrived late on its own" unconditionally, which
+   * was actively misleading during commissioning: a 'gap' answer carries a
+   * counter the tracker has never seen, so the board dutifully answering our
+   * read looked identical to the bullet wandering in by itself. Two of those
+   * lines in a field log — bullets #5 and #7, each landing ~750ms after a read
+   * went out — were read as "the board stopped answering us" when the board had
+   * in fact answered every single request.
+   */
+  private readArrived(
+    targetId: string,
+    absolute: number,
+    kind: ReadKind,
+  ): void {
+    const pending = this.pendingReads.get(targetId);
     if (!pending?.has(absolute)) return;
     this.logger.log(
-      `Bullet #${absolute} arrived late on its own — resend cancelled.`,
+      `Bullet #${absolute} arrived in answer to our ${kind} read request — ` +
+        `chase cancelled.`,
     );
-    this.clearGap(targetId, absolute);
+    this.clearRead(targetId, absolute);
   }
 
-private clearGap(targetId: string, absolute: number): void {
-  const pending = this.pendingGaps.get(targetId);
+private clearRead(targetId: string, absolute: number): void {
+  const pending = this.pendingReads.get(targetId);
   const entry = pending?.get(absolute);
 
   if (!entry) return;
 
   clearTimeout(entry.timer);
-  clearTimeout(entry.lostTimer);
+  if (entry.lostTimer) clearTimeout(entry.lostTimer);
+  if (entry.holdTimer) clearTimeout(entry.holdTimer);
 
   pending!.delete(absolute);
 
   if (pending!.size === 0) {
-    this.pendingGaps.delete(targetId);
+    this.pendingReads.delete(targetId);
   }
 }
+
+  /**
+   * Announce a shot that was written but held back, and run the stage advance
+   * that was deferred with it. Idempotent — the hold timer, a give-up and the
+   * concurrency cap can all reach for the same held shot.
+   */
+  private releaseHeld(targetId: string, absolute: number): void {
+    const key = slotKey(targetId, absolute);
+    const held = this.heldShots.get(key);
+    if (!held) return;
+    this.heldShots.delete(key);
+
+    this.shots.next(held.event);
+    this.logger.log(
+      `${held.event.targetLabel} #${held.event.shotNumber}: MISS (no detection) — ` +
+        `board did not answer the re-read of bullet #${absolute}.`,
+    );
+
+    if (held.advanceSessionId) this.advanceSession(held.advanceSessionId);
+  }
+
+  /** The one place a bullet-limit auto-advance is kicked off. */
+  private advanceSession(sessionId: string): void {
+    void this.sessions
+      .advance(sessionId)
+      .catch((err: Error) =>
+        this.logger.error(
+          `Auto-advance after bullet limit failed for session ${sessionId}: ${err.message}`,
+        ),
+      );
+  }
+
+  /** Forget row mappings for bullets too old for a late arrival to matter. */
+  private pruneSlots(targetId: string, absolute: number): void {
+    const floor = absolute - SLOT_WINDOW;
+    if (floor <= 0) return;
+    const prefix = `${targetId}:`;
+    for (const key of this.slots.keys()) {
+      if (!key.startsWith(prefix)) continue;
+      if (Number(key.slice(prefix.length)) < floor) this.slots.delete(key);
+    }
+  }
   /**
    * Drop everything this service is still chasing for one target.
    *
@@ -334,18 +536,25 @@ private clearGap(targetId: string, absolute: number): void {
    * late frame must not be allowed to fill one.
    */
   resetTarget(targetId: string): void {
-    const pending = this.pendingGaps.get(targetId);
+    const pending = this.pendingReads.get(targetId);
     if (pending) {
       for (const entry of pending.values()) {
         clearTimeout(entry.timer);
-        clearTimeout(entry.lostTimer);
+        if (entry.lostTimer) clearTimeout(entry.lostTimer);
+        if (entry.holdTimer) clearTimeout(entry.holdTimer);
       }
-      this.pendingGaps.delete(targetId);
+      this.pendingReads.delete(targetId);
     }
 
+    // Held shots go unannounced rather than being flushed: they name rows in a
+    // stage that is over, and the client has already cleared its list for the
+    // new one.
     const prefix = `${targetId}:`;
-    for (const key of this.reservedSlots.keys()) {
-      if (key.startsWith(prefix)) this.reservedSlots.delete(key);
+    for (const key of this.slots.keys()) {
+      if (key.startsWith(prefix)) this.slots.delete(key);
+    }
+    for (const key of this.heldShots.keys()) {
+      if (key.startsWith(prefix)) this.heldShots.delete(key);
     }
 
     if (pending?.size) {
@@ -356,16 +565,18 @@ private clearGap(targetId: string, absolute: number): void {
   }
 
   /** Drop every outstanding chase (shutdown). */
-private clearAllGaps(): void {
-  for (const pending of this.pendingGaps.values()) {
+private clearAllReads(): void {
+  for (const pending of this.pendingReads.values()) {
     for (const entry of pending.values()) {
       clearTimeout(entry.timer);
-      clearTimeout(entry.lostTimer);
+      if (entry.lostTimer) clearTimeout(entry.lostTimer);
+      if (entry.holdTimer) clearTimeout(entry.holdTimer);
     }
   }
 
-  this.pendingGaps.clear();
-  this.reservedSlots.clear();
+  this.pendingReads.clear();
+  this.slots.clear();
+  this.heldShots.clear();
 }
 
   // ── Lost bullets ───────────────────────────────────────────────────────────
@@ -385,7 +596,7 @@ private clearAllGaps(): void {
     firedAt: Date,
   ): Promise<void> {
     const key = slotKey(target.id, absolute);
-    if (this.reservedSlots.has(key)) return;
+    if (this.slots.has(key)) return;
 
     const stage = await this.prisma.sessionStage?.findFirst({
       where: { targetId: target.id, status: 'ACTIVE' },
@@ -411,7 +622,7 @@ private clearAllGaps(): void {
       },
     });
 
-    this.reservedSlots.set(key, { stageId: stage.id, shotNumber });
+    this.slots.set(key, { stageId: stage.id, shotNumber });
 
     this.logger.warn(
       `${target.label}: reserved shot #${shotNumber} for missing bullet ` +
@@ -422,9 +633,13 @@ private clearAllGaps(): void {
   /** Giving up is final: announce the placeholder to connected clients. */
   private async publishLost(target: Target, absolute: number): Promise<void> {
     const key = slotKey(target.id, absolute);
-    const slot = this.reservedSlots.get(key);
-    if (!slot) return;
-    this.reservedSlots.delete(key);
+    const slot = this.slots.get(key);
+    if (!slot || slot.announcedLost) return;
+    // The mapping is kept, not deleted — a bullet can still arrive after we
+    // have written it off, and when it does it must fill this row rather than
+    // be appended with a fresh number. `announcedLost` is what stops the giving
+    // up itself from happening twice.
+    slot.announcedLost = true;
 
     const row = await this.prisma.shot?.findUnique({
       where: {
@@ -449,13 +664,7 @@ private clearAllGaps(): void {
         `${target.label}: bullet limit ${stage.bulletLimit} reached on a lost ` +
           `bullet — advancing stage.`,
       );
-      void this.sessions
-        .advance(stage.sessionId)
-        .catch((err: Error) =>
-          this.logger.error(
-            `Auto-advance after bullet limit failed for session ${stage.sessionId}: ${err.message}`,
-          ),
-        );
+      this.advanceSession(stage.sessionId);
     }
 
     this.shots.next({
@@ -504,16 +713,49 @@ private clearAllGaps(): void {
     const target = await this.resolver.resolve(frame.sourceKey);
     if (!target) return;
 
+    // Before the sequence tracker sees it, because the tracker cannot be told
+    // to forget: recording an echo as bullet n makes hasSeen(n) true, which
+    // ends the very chase that produced it. For a gap that is the worse case —
+    // a bullet we never received would be written off as a no-detection on the
+    // strength of our own request coming back.
+    if (this.isOwnEcho(target.id, frame)) {
+      this.logger.debug(
+        `${target.label}: ignored echo of our own read request for bullet ` +
+          `#${frame.bulletCounter}. ${this.formatFrame(frame)}`,
+      );
+      return;
+    }
+
     const { absolute, duplicate, gaps } = this.sequence.observe(
       target.id,
       frame.bulletCounter,
     );
-    if (duplicate) return;
 
-    if (this.sequence.hasSeen(target.id, absolute)) {
-      this.gapArrived(target.id, absolute);
+    // A counter we have already recorded. Normally that is a stray retransmit
+    // and is dropped — but if we asked for this exact bullet back, it is the
+    // answer, and dropping it here is what made every re-read pointless.
+    if (duplicate) {
+      await this.onReadReply(target, frame, absolute);
+      return;
     }
 
+    // Were we already asking the board for this exact bullet?
+    //
+    // This has to be read BEFORE readArrived clears the entry, and the guard it
+    // replaces (`if (this.sequence.hasSeen(absolute))`) was dead code: observe()
+    // records the number a line earlier, so hasSeen was unconditionally true and
+    // the branch said nothing about whether a chase was running.
+    //
+    // The distinction is load-bearing for a 'gap' chase. A gap bullet is one we
+    // never received, so when the board answers our read the counter is NEW to
+    // the tracker — duplicate is false and the frame falls through to the
+    // fresh-shot path below. Left that way, a (0,0) answer to "resend bullet 5"
+    // was treated as bullet 5 arriving late of its own accord, which started a
+    // SECOND chase for the same bullet, whose answer started a third. That is
+    // the feedback loop that turned five missing bullets into twenty datagrams
+    // in two seconds.
+    const answering = this.pendingReads.get(target.id)?.get(absolute)?.kind ?? null;
+    if (answering) this.readArrived(target.id, absolute, answering);
 
     if (gaps.length > 0) {
       this.logger.warn(
@@ -539,7 +781,7 @@ private clearAllGaps(): void {
           );
 
           if (this.resendEnabled) {
-            this.scheduleGapResend(target, gap);
+            this.scheduleRead(target, gap, 'gap');
           } else {
             await this.serializeAndWait(target.id, () => this.publishLost(target, gap));
           }
@@ -548,15 +790,122 @@ private clearAllGaps(): void {
     }
 
     if (isSentinel(frame.rawX, frame.rawY)) {
+      // Never chase a bullet whose answer we are already holding. If this frame
+      // came back because we asked for it, the board has just told us it has no
+      // position for it — asking the same question again cannot change that, and
+      // doing so is what produced the request storms in the field logs.
+      const chasing =
+        this.resendEnabled && this.noDetectReread && answering === null;
       this.logger.warn(
         `${target.label}: shot #${absolute} reported no detection (${frame.rawX}, ${frame.rawY}) — ` +
-          `frame arrived intact and in sequence, so this is a board-side ` +
-          `detection failure, not packet loss. Scored as a miss. ` +
-          `${this.formatFrame(frame)}`,
+          (answering
+            ? `this is the board ANSWERING our ${answering} re-read, and the answer ` +
+              `is that it has nothing stored for that bullet. Scored as a miss.`
+            : `frame arrived intact and in sequence, so this is a board-side ` +
+              `detection failure, not packet loss. ` +
+              (chasing
+                ? `Holding it for up to ${this.noDetectHoldMs}ms while the board is asked to re-read it.`
+                : `Scored as a miss.`)) +
+          ` ${this.formatFrame(frame)}`,
       );
+
+      if (chasing) {
+        this.serialize(target.id, () =>
+          this.beginNoDetectHold(target, frame, absolute),
+        );
+        return;
+      }
     }
 
     this.serialize(target.id, () => this.persistHit(target, frame, absolute));
+  }
+
+  /**
+   * Is this frame the read request we just sent, coming straight back?
+   *
+   * A request is `24 4C n 00 00 00 00 crc 23` — the same nine bytes as a
+   * no-detection hit for bullet n. Nothing in the frame distinguishes the two,
+   * so arrival time is the only evidence: an echo returns at link latency, a
+   * real answer costs the board a lookup. Matched on the wire counter rather
+   * than the unwrapped absolute, because that is the byte we actually sent and
+   * the only one an echo can carry back.
+   */
+  private isOwnEcho(targetId: string, frame: InBoundFrame): boolean {
+    if (!isSentinel(frame.rawX, frame.rawY)) return false;
+
+    const pending = this.pendingReads.get(targetId);
+    if (!pending) return false;
+
+    const now = Date.now();
+    for (const [absolute, entry] of pending) {
+      if ((absolute & 0xff) !== frame.bulletCounter) continue;
+      if (entry.lastSentAt > 0 && now - entry.lastSentAt <= ECHO_WINDOW_MS) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * A frame whose bullet counter we have already recorded.
+   *
+   * The only reason to look twice at one is that we asked for it. Everything
+   * else — a stray retransmit, a board repeating itself — is noise and is
+   * dropped, exactly as it was before there was a read command.
+   */
+  private async onReadReply(
+    target: Target,
+    frame: InBoundFrame,
+    absolute: number,
+  ): Promise<void> {
+    const pending = this.pendingReads.get(target.id)?.get(absolute);
+    if (!pending) return;
+
+    if (isSentinel(frame.rawX, frame.rawY)) {
+      // Echoes were already filtered upstream by isOwnEcho, so this is the
+      // board genuinely answering that it has nothing. Let the backoff run —
+      // the next attempt may still find it.
+      this.logger.warn(
+        `${target.label}: re-read of bullet #${absolute} came back (0,0) again — ` +
+          `the board has no position stored for it. ${this.formatFrame(frame)}`,
+      );
+      return;
+    }
+
+    this.logger.log(
+      `${target.label}: bullet #${absolute} recovered by re-read — ` +
+        `the board answered with a position. ${this.formatFrame(frame)}`,
+    );
+
+    this.clearRead(target.id, absolute);
+    await this.serializeAndWait(target.id, () =>
+      this.persistHit(target, frame, absolute),
+    );
+  }
+
+  /**
+   * A no-detection shot, written but not shown.
+   *
+   * The row goes in immediately so the shot keeps its number and the database
+   * is never behind the board. The socket event does not, because the board may
+   * still be able to produce a position for it: announcing a MISS now and a
+   * score 800ms later means every operator watching sees a hole appear where a
+   * miss was, on a screen they are using to call the shoot. releaseHeld is the
+   * single exit — hold timer, give-up, or the concurrency cap.
+   */
+  private async beginNoDetectHold(
+    target: Target,
+    frame: InBoundFrame,
+    absolute: number,
+  ): Promise<void> {
+    const event = await this.persistHit(target, frame, absolute, {
+      deferEmit: true,
+    });
+    // No active stage, or over the bullet limit — nothing was written, so there
+    // is nothing to hold and nothing to chase.
+    if (!event) return;
+
+    this.scheduleRead(target, absolute, 'nodetect');
   }
 
 
@@ -606,6 +955,7 @@ private clearAllGaps(): void {
     target: Target,
     frame: InBoundFrame,
     absolute?: number,
+    opts?: { deferEmit?: boolean },
   ): Promise<ShotEvent | null> {
     const stage = await this.prisma.sessionStage.findFirst({
       where: { targetId: target.id, status: 'ACTIVE' },
@@ -623,10 +973,17 @@ private clearAllGaps(): void {
     const reservationKey =
       absolute != null ? slotKey(target.id, absolute) : null;
     const reservation = reservationKey
-      ? this.reservedSlots.get(reservationKey)
+      ? this.slots.get(reservationKey)
       : undefined;
     const filledReservation =
       reservation?.stageId === stage.id ? reservation : undefined;
+
+    // A held shot being corrected: it never reached a client, so the advance it
+    // was carrying never ran. Take it over rather than letting it vanish with
+    // the held record — a stage that ends on a recovered no-detection must
+    // still end.
+    const held = reservationKey ? this.heldShots.get(reservationKey) : undefined;
+    if (held && reservationKey) this.heldShots.delete(reservationKey);
 
     const shotNumber = filledReservation
       ? filledReservation.shotNumber
@@ -674,7 +1031,17 @@ private clearAllGaps(): void {
       },
     });
 
-    if (reservationKey) this.reservedSlots.delete(reservationKey);
+    // Recorded, not deleted: this is the mapping that lets a later re-read
+    // correction — or a bullet that turns up long after we wrote it off — land
+    // in this row instead of being appended with a fresh number.
+    if (reservationKey) {
+      this.slots.set(reservationKey, {
+        stageId: stage.id,
+        shotNumber,
+        announcedLost: false,
+      });
+      if (absolute != null) this.pruneSlots(target.id, absolute);
+    }
 
     const stageShotCount = filledReservation
       ? await this.prisma.shot.count({ where: { sessionStageId: stage.id } })
@@ -696,24 +1063,24 @@ private clearAllGaps(): void {
       firedAt: frame.receivedAt,
       stageShotCount,
     };
-    this.shots.next(event);
-
-
-    if (
+    const completesStage =
       !filledReservation &&
       stage.bulletLimit > 0 &&
-      stageShotCount >= stage.bulletLimit
-    ) {
-      this.logger.log(
-        `${target.label}: bullet limit ${stage.bulletLimit} reached — advancing stage.`,
-      );
-      void this.sessions
-        .advance(stage.sessionId)
-        .catch((err: Error) =>
-          this.logger.error(
-            `Auto-advance after bullet limit failed for session ${stage.sessionId}: ${err.message}`,
-          ),
+      stageShotCount >= stage.bulletLimit;
+
+    if (opts?.deferEmit && reservationKey) {
+      this.heldShots.set(reservationKey, {
+        event,
+        advanceSessionId: completesStage ? stage.sessionId : null,
+      });
+    } else {
+      this.shots.next(event);
+      if (completesStage || held?.advanceSessionId) {
+        this.logger.log(
+          `${target.label}: bullet limit ${stage.bulletLimit} reached — advancing stage.`,
         );
+        this.advanceSession(held?.advanceSessionId ?? stage.sessionId);
+      }
     }
 
     // The whole arithmetic is printed on every located shot, not just the
@@ -733,7 +1100,9 @@ private clearAllGaps(): void {
     // and uncalibrated shots line up column-wise and grep the same way.
     // Omitted entirely on a miss: there are no coordinates for it to explain.
     const geometry = scored.isMiss
-      ? 'MISS (no detection)'
+      ? opts?.deferEmit
+        ? 'MISS (no detection) — row written, held pending re-read'
+        : 'MISS (no detection)'
       : `raw(${toSigned16(frame.rawX)}, ${
           toSigned16(frame.rawY) - SENSOR_Y_FLOOR_BIAS_MM
         }) + ${

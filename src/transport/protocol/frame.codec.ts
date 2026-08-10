@@ -5,7 +5,6 @@ export const TRAILER = 0x23;
 export const CMD_PLAY = 0x50;
 export const CMD_STOP = 0x53;
 export const CMD_HIT = 0x4c;
-export const CMD_RESEND = 0x52;
 export const CMD_TELEMETRY = 0x3a;
 
 
@@ -25,6 +24,23 @@ export const WIPERS_PER_PAGE = 5;
 
 const CRC_CONST = 0x24;
 
+/**
+ * How soon after sending a read-shot request an identical frame coming back is
+ * treated as the board echoing our command rather than answering it.
+ *
+ * A read request is `24 4C n 00 00 00 00 crc 23` — byte for byte a real
+ * no-detection answer for bullet n. Nothing in the nine bytes tells the two
+ * apart, so arrival time is the only evidence there is: an echo returns at link
+ * latency, a real answer costs the board a stored-shot lookup (~600ms observed
+ * on the dev board over the direct AP link).
+ *
+ * Lives here, next to buildReadShotFrame, because both the live ingestion path
+ * (SensorService.isOwnEcho) and the commissioning read (TargetsService.readShot)
+ * have to make the same call, and two copies of this number drifting apart
+ * means one surface calls a real answer an echo while the other does not.
+ */
+export const ECHO_WINDOW_MS = 120;
+
 
 function toSigned16(raw: number): number {
   const v = raw & 0xffff;
@@ -35,7 +51,6 @@ export type FrameCommand =
   | typeof CMD_PLAY
   | typeof CMD_STOP
   | typeof CMD_HIT
-  | typeof CMD_RESEND
   | typeof CMD_TELEMETRY
   | typeof CMD_GET_WIPER
   | typeof CMD_WRITE_WIPER
@@ -71,7 +86,7 @@ export function calculateCrc(command: number, dataBytes: number[] = [0, 0, 0, 0,
   return crc & 0xff;
 }
 
-/** Build an outbound frame (PLAY / STOP / RESEND / simulated HIT). */
+/** Build an outbound frame (PLAY / STOP / read-shot / simulated HIT). */
 export function buildFrame(command: number, dataBytes: number[] = [0, 0, 0, 0, 0]): Buffer {
   const buf = Buffer.alloc(FRAME_SIZE);
   buf[0] = HEADER;
@@ -88,8 +103,28 @@ export function buildFrame(command: number, dataBytes: number[] = [0, 0, 0, 0, 0
 
 export const buildPlayFrame = (): Buffer => buildFrame(CMD_PLAY);
 export const buildStopFrame = (): Buffer => buildFrame(CMD_STOP);
-export const buildResendFrame = (bullet: number): Buffer =>
-  buildFrame(CMD_RESEND, [bullet & 0xff, 0, 0, 0, 0]);
+/**
+ * Ask the board to send one specific shot again — `24 4C n 00 00 00 00 crc 23`.
+ *
+ * The command byte is 'L', the SAME opcode the board uses to report a hit. That
+ * is not a copy-paste slip: the spec's read example is `Tx: 0x24 'L' 5 0 0 0 0`,
+ * and the reply comes back as an ordinary 'L' hit frame. This used to be built
+ * with 'R' (0x52), which the spec lists as "Read Params (not implemented)" — the
+ * board discarded every one of them, silently, which is why no resend had ever
+ * recovered a bullet.
+ *
+ * Two consequences fall out of sharing the opcode, both handled in SensorService
+ * and both easy to reintroduce by accident:
+ *
+ *   1. A request with a zero payload is byte-identical to a real no-detection
+ *      hit for that same bullet number. If the board echoes commands (it echoes
+ *      P/S/H/T/W), the echo is indistinguishable from a miss on its own bytes —
+ *      see the echo guard in onHit.
+ *   2. The reply's bullet counter has already been recorded, so the sequence
+ *      tracker calls it a duplicate. Ingesting it requires knowing we asked.
+ */
+export const buildReadShotFrame = (shot: number): Buffer =>
+  buildFrame(CMD_HIT, [shot & 0xff, 0, 0, 0, 0]);
 
 export function buildHitFrame(x: number, y: number, bulletCounter: number): Buffer {
   return buildFrame(CMD_HIT, [
@@ -159,6 +194,8 @@ export function decodeSelfTest(payload: readonly number[]): SelfTestReply {
 }
 
 
+// CMD_HIT covers both directions: an unprompted hit during play, and the reply
+// to a read-shot request. There is no separate inbound opcode for the latter.
 const DECODABLE_COMMANDS = new Set<number>([
   CMD_PLAY,
   CMD_STOP,

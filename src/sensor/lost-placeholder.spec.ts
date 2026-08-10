@@ -44,10 +44,21 @@ interface Row {
   firedAt: Date;
 }
 
-function harness({ resend = true }: { resend?: boolean } = {}) {
+function harness({
+  resend = true,
+  noDetect = false,
+  holdMs = 60,
+  bulletLimit = 0,
+}: {
+  resend?: boolean;
+  noDetect?: boolean;
+  holdMs?: number;
+  bulletLimit?: number;
+} = {}) {
   const rows = new Map<number, Row>();
   const emitted: ShotEvent[] = [];
   const resent: number[] = [];
+  const advanced: string[] = [];
 
   const target = {
     id: 't1',
@@ -63,7 +74,7 @@ function harness({ resend = true }: { resend?: boolean } = {}) {
     sessionId: 'sess1',
     order: 0,
     profileType: 'FIGURE',
-    bulletLimit: 0,
+    bulletLimit,
     status: 'ACTIVE',
   };
 
@@ -103,6 +114,11 @@ function harness({ resend = true }: { resend?: boolean } = {}) {
         SENSOR_RESEND_ENABLED: String(resend),
         RESEND_GRACE_MS: String(GRACE_MS),
         MAX_RESEND_ATTEMPTS: String(MAX_ATTEMPTS),
+        NO_DETECT_REREAD: String(noDetect),
+        NO_DETECT_HOLD_MS: String(holdMs),
+        // See gap-resend.spec.ts — the production floor on grace/hold is off
+        // here so these tests can run on a compressed timeline.
+        BOARD_READ_LATENCY_MS: '0',
       })[key] ?? fallback,
   };
 
@@ -110,18 +126,23 @@ function harness({ resend = true }: { resend?: boolean } = {}) {
     prisma as any,
     { frames$: { subscribe: vi.fn() } } as any,
     {
-      resend: vi.fn(async (_t: unknown, b: number) => void resent.push(b)),
+      readShotRequest: vi.fn(
+        async (_t: unknown, b: number) => void resent.push(b),
+      ),
     } as any,
     new SequenceTracker(),
     { resolve: vi.fn(async () => target) } as any,
-    { events$: { subscribe: vi.fn() }, advance: vi.fn() } as any,
+    {
+      events$: { subscribe: vi.fn() },
+      advance: vi.fn(async (id: string) => void advanced.push(id)),
+    } as any,
     { setHeld: vi.fn() } as any,
     config as any,
   );
 
   service.shots$.subscribe((e) => emitted.push(e));
 
-  return { service, rows, emitted, resent };
+  return { service, rows, emitted, resent, advanced };
 }
 
 /** A real 9-byte hit frame, encoded then decoded like one off the wire. */
@@ -194,8 +215,10 @@ describe('lost-bullet placeholders', () => {
 
     // And critically, #8 is the bullet the BOARD called 8 — not slid down into
     // 7's slot. (34, 470) raw is the hit that scored, so its neighbours are
-    // what pins the alignment.
-    expect(rows.get(4)!.score).toBe(5);
+    // what pins the alignment. It lands 34mm right and 30mm low of centre,
+    // outside the Figure-11 centre box (half-width 22.5mm) and inside the
+    // middle one — a 4, not the 5 this asserted while the boxes were wider.
+    expect(rows.get(4)!.score).toBe(4);
     expect(rows.get(4)!.isMiss).toBe(false);
     expect(rows.get(5)!.isMiss).toBe(false);
     expect(rows.get(8)!.isMiss).toBe(false);
@@ -239,13 +262,43 @@ describe('lost-bullet placeholders', () => {
     // Filled in place: same row, no longer lost, and NOT appended as #4.
     expect(rows.get(2)!.isLost).toBe(false);
     expect(rows.get(2)!.isMiss).toBe(false);
-    expect(rows.get(2)!.score).toBe(5);
+    expect(rows.get(2)!.score).toBe(4);
     expect(rows.has(4)).toBe(false);
 
     // The late bullet is announced as a real shot, never as lost.
     const two = emitted.filter((e) => e.shotNumber === 2);
     expect(two).toHaveLength(1);
     expect(two[0].isLost).toBe(false);
+  });
+
+  it('lets a bullet that arrives AFTER we gave up still fill its own row', async () => {
+    const { service, rows, emitted } = harness();
+
+    await feed(service, hit(1, 34, 470));
+    await feed(service, hit(3, 8, 783));
+
+    // Chase, give up, announce #2 as lost.
+    await settle(GRACE_MS * 10);
+    expect(rows.get(2)!.isLost).toBe(true);
+    expect(emitted.find((e) => e.shotNumber === 2)!.isLost).toBe(true);
+
+    // Now it turns up — a slow board, or an answer to the last request that
+    // outran our patience. The row mapping has to have survived the write-off,
+    // or this lands as a brand-new #4 and the stage gains a round that was
+    // never fired.
+    await feed(service, hit(2, 34, 470));
+    await settle(GRACE_MS * 2);
+
+    expect(sorted(rows).map((r) => r.shotNumber)).toEqual([1, 2, 3]);
+    expect(rows.get(2)!.isLost).toBe(false);
+    expect(rows.get(2)!.score).toBe(4);
+
+    // Announced twice, and the second one is the correction. The client keeps
+    // the later, located version — see isDowngrade in shotCoordinates.ts.
+    const two = emitted.filter((e) => e.shotNumber === 2);
+    expect(two).toHaveLength(2);
+    expect(two[1].isLost).toBe(false);
+    expect(two[1].isMiss).toBe(false);
   });
 
   it('does not fabricate rows when the sequence anchor is desynced', async () => {
@@ -260,5 +313,108 @@ describe('lost-bullet placeholders', () => {
     // Two real shots, two rows. No invented bullets in between.
     expect(sorted(rows).map((r) => r.shotNumber)).toEqual([1, 2]);
     expect([...rows.values()].every((r) => !r.isLost)).toBe(true);
+  });
+});
+
+// What the shooter is shown while a no-detection shot is being chased.
+//
+// The rule: a round appears on the target once, and the first thing shown about
+// it is the truth. A MISS that becomes a 9 half a second later is worse than a
+// pause — the operator is calling the shoot off that screen.
+describe('holding a no-detection shot while the board is re-read', () => {
+  beforeEach(() => vi.clearAllMocks());
+  afterEach(() => vi.restoreAllMocks());
+
+  const HOLD_MS = 60;
+
+  it('writes the row immediately but announces nothing yet', async () => {
+    const { service, rows, emitted } = harness({ noDetect: true, holdMs: HOLD_MS });
+
+    await feed(service, hit(1, 34, 470));
+    await feed(service, hit(2, ...NO_DETECTION));
+
+    // The database is never behind the board: the row exists the moment the
+    // frame lands, which is what keeps the NEXT shot's number right.
+    expect(rows.get(2)).toBeDefined();
+    expect(rows.get(2)!.isMiss).toBe(true);
+
+    // But the shooter has not been told anything about it.
+    expect(emitted.map((e) => e.shotNumber)).toEqual([1]);
+  });
+
+  it('paints it as a real bullet when the board answers, never as a miss', async () => {
+    const { service, rows, emitted } = harness({ noDetect: true, holdMs: HOLD_MS });
+
+    await feed(service, hit(1, 34, 470));
+    await feed(service, hit(2, ...NO_DETECTION));
+    await settle(GRACE_MS + 5); // the request goes out
+
+    // The board answers with a position for a counter it already sent.
+    await feed(service, hit(2, 34, 470));
+    await settle(HOLD_MS * 3);
+
+    expect(rows.get(2)!.isMiss).toBe(false);
+    expect(rows.get(2)!.score).toBe(4);
+
+    // Announced exactly once, and as a hit. The held miss never reached anyone.
+    const two = emitted.filter((e) => e.shotNumber === 2);
+    expect(two).toHaveLength(1);
+    expect(two[0].isMiss).toBe(false);
+  });
+
+  it('falls back to a MISS once the hold expires with no answer', async () => {
+    const { service, rows, emitted } = harness({ noDetect: true, holdMs: HOLD_MS });
+
+    await feed(service, hit(1, 34, 470));
+    await feed(service, hit(2, ...NO_DETECTION));
+    await settle(HOLD_MS * 4);
+
+    expect(rows.get(2)!.isMiss).toBe(true);
+    const two = emitted.filter((e) => e.shotNumber === 2);
+    expect(two).toHaveLength(1);
+    expect(two[0].isMiss).toBe(true);
+    // A miss, not a lost bullet: the frame did arrive.
+    expect(two[0].isLost).toBe(false);
+  });
+
+  it('does not let a recovered shot swallow the stage advance it was carrying', async () => {
+    // A no-detection as the LAST round of a limited stage. The advance rides
+    // along with the held event; if the re-read then succeeds and the held
+    // record is simply discarded, the advance goes with it and the stage never
+    // ends — the shooter is left on a finished stage waiting for a round they
+    // already fired.
+    const { service, advanced } = harness({
+      noDetect: true,
+      holdMs: HOLD_MS,
+      bulletLimit: 2,
+    });
+
+    await feed(service, hit(1, 34, 470));
+    await feed(service, hit(2, ...NO_DETECTION));
+    await settle(GRACE_MS + 5);
+
+    expect(advanced).toEqual([]); // still held, so the stage must not have moved
+
+    await feed(service, hit(2, 8, 783)); // the board answers
+    await settle(HOLD_MS * 3);
+
+    expect(advanced).toEqual(['sess1']);
+  });
+
+  it('advances the stage on a held miss too, once the hold expires', async () => {
+    const { service, advanced, emitted } = harness({
+      noDetect: true,
+      holdMs: HOLD_MS,
+      bulletLimit: 2,
+    });
+
+    await feed(service, hit(1, 34, 470));
+    await feed(service, hit(2, ...NO_DETECTION));
+    expect(advanced).toEqual([]);
+
+    await settle(HOLD_MS * 4);
+
+    expect(emitted.filter((e) => e.shotNumber === 2)).toHaveLength(1);
+    expect(advanced).toEqual(['sess1']);
   });
 });

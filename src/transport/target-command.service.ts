@@ -7,13 +7,14 @@ import {
   buildGetWiperFrame,
   buildHeartbeatFrame,
   buildPlayFrame,
-  buildResendFrame,
+  buildReadShotFrame,
   buildSelfTestFrame,
   buildStopFrame,
   buildWriteWiperFrame,
   CMD_DEV_DATA,
   CMD_GET_WIPER,
   CMD_HEARTBEAT,
+  CMD_HIT,
   CMD_PLAY,
   CMD_SELF_TEST,
   CMD_STOP,
@@ -49,6 +50,17 @@ export interface FrameExchange {
   /** The board's reply frame, space-separated uppercase hex, or null if it
    *  never answered within budget. */
   rxHex: string | null;
+  /**
+   * Milliseconds between putting the winning attempt on the wire and the reply
+   * arriving, or null if there was no reply.
+   *
+   * Carried out of the transport because for read-shot it is load-bearing, not
+   * diagnostic: a board with nothing stored for a bullet answers with the exact
+   * bytes it was asked with, so round-trip time is the only thing separating
+   * "no position for that shot" from "this firmware just echoes commands".
+   * See ECHO_WINDOW_MS.
+   */
+  elapsedMs: number | null;
   /** Human-readable summary, including what to check on failure. */
   message: string;
 }
@@ -144,15 +156,53 @@ export class TargetCommandService implements OnModuleInit, OnModuleDestroy {
     await this.registry.send(target, buildStopFrame());
   }
 
-  async resend(target: TargetRef, bulletCounter: number): Promise<void> {
-    const frame = buildResendFrame(bulletCounter);
+  /**
+   * Ask a board to send one shot again — fire-and-forget, no waiter.
+   *
+   * Deliberately outside the request/once retry wrapper that every other
+   * command uses. The reply is an ordinary 'L' hit frame, which SensorService
+   * must ingest through its own sequence/slot machinery; latching a waiter onto
+   * it here would settle on whichever 'L' arrived first, including a live shot
+   * from the shooter. Retries are SensorService's job — it is the only place
+   * that knows whether the bullet has since turned up.
+   */
+  async readShotRequest(target: TargetRef, shot: number): Promise<void> {
+    const frame = buildReadShotFrame(shot);
 
     this.logger.log(
-      `↩ RESEND #${bulletCounter} -> ${target.label} (${target.ipAddress}) ` +
+      `↩ READ SHOT #${shot} -> ${target.label} (${target.ipAddress}) ` +
       `frame=[${frame.toString('hex').match(/../g)?.join(' ')}]`,
     );
 
     await this.registry.send(target, frame);
+  }
+
+  /**
+   * One read-shot round trip with the raw bytes kept — the commissioning
+   * console's way of answering "does this firmware implement the read at all?"
+   * without needing a live relay to produce a gap first.
+   *
+   * Unlike readShotRequest this DOES wait for a reply, which is only safe
+   * because the route behind it refuses to run mid-relay: the match is on
+   * command + bullet counter, and during sustained fire a real shot carrying
+   * that counter would settle the waiter just as well as an answer would.
+   */
+  async readShot(
+    target: TargetRef,
+    shot: number,
+  ): Promise<{ rawX: number | null; rawY: number | null; exchange: FrameExchange }> {
+    let rawX: number | null = null;
+    let rawY: number | null = null;
+    const exchange = await this.exchange(target, buildReadShotFrame(shot), {
+      label: 'READ-SHOT',
+      match: (f) => {
+        if (f.command !== CMD_HIT || f.bulletCounter !== (shot & 0xff)) return false;
+        rawX = f.rawX;
+        rawY = f.rawY;
+        return true;
+      },
+    });
+    return { rawX, rawY, exchange };
   }
 
 
@@ -209,6 +259,11 @@ export class TargetCommandService implements OnModuleInit, OnModuleDestroy {
         command: 'G',
         txHex: formatFrame(frame),
         rxHex: formatFrame(Buffer.from(reply.bytes)),
+        // Wiper reads go through `request` directly rather than `exchange`, and
+        // nothing downstream distinguishes a wiper reply from an echo — a 'G'
+        // answer carries five values, so it is never byte-identical to the
+        // request that asked for it.
+        elapsedMs: null,
         message: `${label} — ${values.join(', ')}`,
       },
     };
@@ -294,11 +349,20 @@ export class TargetCommandService implements OnModuleInit, OnModuleDestroy {
     opts: { label: string; match: (f: InBoundFrame) => boolean },
   ): Promise<FrameExchange> {
     let reply: InBoundFrame | undefined;
+    // Stamped per attempt, not once for the whole exchange: `enqueue` can park
+    // this behind another command for arbitrarily long, and `request` may retry.
+    // Only the gap between the winning send and its reply says anything.
+    let sentAt = 0;
+    let elapsedMs: number | null = null;
     const result = await this.enqueue(sourceKeyOf(target), () =>
       this.request(target, frame, {
+        onSend: () => {
+          sentAt = Date.now();
+        },
         match: (f) => {
           if (!opts.match(f)) return undefined;
           reply = f;
+          elapsedMs = sentAt > 0 ? Date.now() - sentAt : null;
           return true;
         },
         label: opts.label,
@@ -312,6 +376,7 @@ export class TargetCommandService implements OnModuleInit, OnModuleDestroy {
       command: opts.label,
       txHex: formatFrame(frame),
       rxHex: reply ? formatFrame(Buffer.from(reply.bytes)) : null,
+      elapsedMs: ok ? elapsedMs : null,
       message: ok
         ? `${opts.label} acknowledged`
         : `${opts.label} — no reply within ${this.requestTimeoutMs * this.requestAttempts}ms. Check power and association.`,
@@ -337,10 +402,18 @@ export class TargetCommandService implements OnModuleInit, OnModuleDestroy {
       label: string;
       timeoutMs: number;
       attempts: number;
+      /** Called immediately before each attempt goes on the wire. */
+      onSend?: () => void;
     },
   ): Promise<T | undefined> {
     for (let attempt = 1; attempt <= opts.attempts; attempt++) {
-      const result = await this.once(target, frame, opts.match, opts.timeoutMs);
+      const result = await this.once(
+        target,
+        frame,
+        opts.match,
+        opts.timeoutMs,
+        opts.onSend,
+      );
       if (result !== undefined) return result;
       if (attempt < opts.attempts) {
         this.logger.warn(
@@ -357,6 +430,7 @@ export class TargetCommandService implements OnModuleInit, OnModuleDestroy {
     frame: Buffer,
     match: (f: InBoundFrame) => T | undefined,
     timeoutMs: number,
+    onSend?: () => void,
   ): Promise<T | undefined> {
     const key = sourceKeyOf(target);
     return new Promise<T | undefined>((resolve) => {
@@ -374,6 +448,10 @@ export class TargetCommandService implements OnModuleInit, OnModuleDestroy {
       const list = this.waiters.get(key) ?? [];
       list.push(waiter as Waiter);
       this.waiters.set(key, list);
+
+      // Before the send, not after: the echo this timestamp exists to detect
+      // can be back inside a millisecond on a direct AP link.
+      onSend?.();
 
       this.registry.send(target, frame).catch((err: Error) => {
         this.removeWaiter(key, waiter as Waiter);

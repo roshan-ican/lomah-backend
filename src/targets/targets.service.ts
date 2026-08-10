@@ -15,8 +15,15 @@ import { PrismaService } from '@/common/prisma/prisma.service';
 import { TargetResolver } from '@/sensor/target-resolver.service';
 import { TargetCommandService } from '@/transport/target-command.service';
 import { SequenceTracker } from '@/transport/protocol/sequence.tracker';
+import { ECHO_WINDOW_MS } from '@/transport/protocol/frame.codec';
 import type { WiperPage } from '@/transport/protocol/frame.codec';
-import { scoreAt, signedMm } from '@/sensor/scoring';
+import {
+  isSentinel,
+  scoreAt,
+  signedMm,
+  toSigned16,
+  SENSOR_Y_FLOOR_BIAS_MM,
+} from '@/sensor/scoring';
 import type { TargetCalibratedEvent } from './target.events';
 
 /** Prisma's code for "a unique constraint was violated". */
@@ -381,6 +388,91 @@ export class TargetsService implements OnModuleDestroy {
       message: exchange.ok
         ? `${target.label} shot #${shot} — sensors 0x${sensors?.toString(16).toUpperCase().padStart(2, '0') ?? '??'}`
         : exchange.message,
+    };
+  }
+
+  /**
+   * 'L' — ask the board to send one specific shot again, and report exactly
+   * what came back.
+   *
+   * The point of this route is to answer a question the server logs cannot: does
+   * this firmware implement the read at all? A gap resend is fire-and-forget, so
+   * "no bullet recovered" is indistinguishable from "the board ignored us". Here
+   * the round trip is explicit and the raw bytes are returned either way.
+   *
+   * Refuses mid-relay, unlike the 'D' read. This is the one command whose reply
+   * shares an opcode AND a counter with a live hit, so during a string the
+   * waiter would settle on the shooter's next shot and report it as an answer.
+   *
+   * `echoed` is the other trap, and the reason this route used to report a
+   * working board as a broken one. A request carries a zero payload, so the nine
+   * bytes we send are IDENTICAL to a no-detection answer for the same shot:
+   * `24 4C n 00 00 00 00 crc 23` either way. Comparing rxHex to txHex therefore
+   * cannot tell "the board has no position for shot n" from "the board just
+   * echoes commands" — and since the first case is the common one (that is
+   * precisely why anyone re-reads a shot), the old byte comparison declared
+   * "read not implemented" every time the read was working perfectly.
+   *
+   * Round-trip time is the only thing that separates them: an echo returns at
+   * link latency, an answer costs the board a stored-shot lookup. So an
+   * identical frame is only called an echo when it comes back inside
+   * ECHO_WINDOW_MS; slower than that it is the board saying it has nothing.
+   * This is the same rule SensorService.isOwnEcho applies on the live path.
+   */
+  async readShot(id: string, shot: number) {
+    const target = await this.findOne(id);
+    await this.assertNotMidRelay(id, target.label, 'Re-reading a shot from');
+
+    const { rawX, rawY, exchange } = await this.command.readShot(
+      this.refOf(target),
+      shot,
+    );
+
+    const identical = exchange.ok && exchange.rxHex === exchange.txHex;
+    const withinEchoWindow =
+      exchange.elapsedMs !== null && exchange.elapsedMs <= ECHO_WINDOW_MS;
+    const echoed = identical && withinEchoWindow;
+    const noDetection = exchange.ok && !echoed && isSentinel(rawX ?? 0, rawY ?? 0);
+
+    const rtt = exchange.elapsedMs === null ? '' : ` (${exchange.elapsedMs}ms)`;
+
+    let message: string;
+    if (!exchange.ok) {
+      message =
+        `${target.label} did not answer a read of shot #${shot}. Either the ` +
+        `firmware does not implement 'L' reads, or the board is unreachable — ` +
+        `run a heartbeat to tell those apart.`;
+    } else if (echoed) {
+      message =
+        `${target.label} bounced the request straight back${rtt} — too fast to ` +
+        `be a lookup, so treat this as "read not implemented" rather than a miss.`;
+    } else if (noDetection) {
+      message =
+        `${target.label} answered${rtt} that it has no stored position for shot ` +
+        `#${shot} (0, 0) — the read works, the board simply never triangulated ` +
+        `that shot. Run the 'D' read on the same shot to see which sensors fired.`;
+    } else {
+      message =
+        `${target.label} shot #${shot}${rtt} — raw (${toSigned16(rawX ?? 0)}, ` +
+        `${toSigned16(rawY ?? 0) - SENSOR_Y_FLOOR_BIAS_MM})mm from centre, ` +
+        `before this target's calibration offset.`;
+    }
+
+    return {
+      targetId: target.id,
+      label: target.label,
+      ipAddress: target.ipAddress,
+      command: 'L',
+      shot,
+      ok: exchange.ok && !echoed,
+      echoed,
+      noDetection,
+      txHex: exchange.txHex,
+      rxHex: exchange.rxHex,
+      elapsedMs: exchange.elapsedMs,
+      rawX,
+      rawY,
+      message,
     };
   }
 

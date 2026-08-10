@@ -7,6 +7,7 @@ import { CalibrateFromShotDto } from './dto/calibrate-from-shot.dto';
 import { ReadWipersDto } from './dto/read-wipers.dto';
 import { WriteWiperDto } from './dto/write-wiper.dto';
 import { DevDataDto } from './dto/dev-data.dto';
+import { ReadShotDto } from './dto/read-shot.dto';
 import { Roles } from '@/auth/decorators/roles.decorator';
 
 @Controller('targets')
@@ -76,6 +77,25 @@ export class TargetsController {
   @Post(':id/dev-data')
   devData(@Param('id') id: string, @Body() dto: DevDataDto) {
     return this.targetsService.devData(id, dto.shot);
+  }
+
+  /**
+   * 'L' — ask the board to send one shot again, and report the raw exchange.
+   *
+   * The commissioning answer to "does this firmware implement the read?". Gap
+   * recovery uses the same command but fire-and-forget, so a board that ignores
+   * it looks exactly like a board that has nothing to send. Here the round trip
+   * is explicit: `rxHex: null` means no reply, `echoed: true` means the board
+   * bounced the request back instead of answering.
+   *
+   * SUPER_ADMIN only, and refused mid-relay — unlike 'D', this reply shares both
+   * its opcode and its counter with a live hit, so running it during a string
+   * would latch onto the shooter's next shot.
+   */
+  @Roles('SUPER_ADMIN')
+  @Post(':id/read-shot')
+  readShot(@Param('id') id: string, @Body() dto: ReadShotDto) {
+    return this.targetsService.readShot(id, dto.shot);
   }
 
   /**

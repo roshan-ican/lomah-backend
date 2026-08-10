@@ -1,7 +1,7 @@
 import { Subject } from 'rxjs';
 import { describe, expect, it, vi } from 'vitest';
 
-import { CMD_GET_WIPER, CMD_PLAY } from './protocol/frame.codec';
+import { CMD_GET_WIPER, CMD_HIT, CMD_PLAY } from './protocol/frame.codec';
 import type { InBoundFrame, TargetRef } from './target-transport.interface';
 import { TargetCommandService } from './target-command.service';
 import type { TransportRegistry } from './transport.registry';
@@ -33,14 +33,19 @@ function targetRef(id: string, ip: string): TargetRef {
   return { id, laneId: '1', label: `Target ${id}`, transport: 'WIFI', ipAddress: ip };
 }
 
-function inbound(sourceKey: string, command: number, payload: number[]): InBoundFrame {
+function inbound(
+  sourceKey: string,
+  command: number,
+  payload: number[],
+  coords: { rawX: number; rawY: number } = { rawX: 0, rawY: 0 },
+): InBoundFrame {
   return {
     sourceKey,
     transport: 'WIFI',
     command,
     bulletCounter: payload[0] ?? 0,
-    rawX: 0,
-    rawY: 0,
+    rawX: coords.rawX,
+    rawY: coords.rawY,
     payload,
     bytes: [0x24, command, ...payload, 0x00, 0x23],
     receivedAt: new Date(),
@@ -182,6 +187,78 @@ describe('TargetCommandService', () => {
     // which also finds nothing waiting) and settles false well within the
     // fast test timeout, rather than needing the full un-cancelled budget.
     expect(await playResult).toBe(false);
+    svc.onModuleDestroy();
+  });
+
+  it('readShotRequest() puts the spec\'s exact read frame on the wire', async () => {
+    const { registry, send } = makeFakeRegistry();
+    const svc = new TargetCommandService(registry, makeFakeConfig(FAST_CONFIG));
+    svc.onModuleInit();
+
+    await svc.readShotRequest(targetRef('t1', '10.0.1.11'), 5);
+
+    // Tx: 0x24 'L' 5 0 0 0 0 crc 0x23, crc = 0x24 + 0x4C + 5 = 0x75.
+    expect(send.mock.calls[0]![1]).toEqual(
+      Buffer.from([0x24, 0x4c, 0x05, 0, 0, 0, 0, 0x75, 0x23]),
+    );
+    svc.onModuleDestroy();
+  });
+
+  it('readShot() returns the position from a reply for the shot it asked about', async () => {
+    const { registry, frames } = makeFakeRegistry();
+    const svc = new TargetCommandService(registry, makeFakeConfig(FAST_CONFIG));
+    svc.onModuleInit();
+
+    const result = svc.readShot(targetRef('t1', '10.0.1.11'), 5);
+    queueMicrotask(() =>
+      frames.next(
+        inbound('10.0.1.11', CMD_HIT, [5, 0x01, 0x0d, 0x09, 0x41], {
+          rawX: 269,
+          rawY: 2369,
+        }),
+      ),
+    );
+
+    const { rawX, rawY, exchange } = await result;
+    expect(exchange.ok).toBe(true);
+    expect(rawX).toBe(269);
+    expect(rawY).toBe(2369);
+    svc.onModuleDestroy();
+  });
+
+  it('readShot() ignores a hit for a DIFFERENT shot number', async () => {
+    // The reply shares its opcode with every live hit, so the counter is the
+    // only thing that makes it an answer rather than someone else's round.
+    const { registry, frames } = makeFakeRegistry();
+    const svc = new TargetCommandService(registry, makeFakeConfig(FAST_CONFIG));
+    svc.onModuleInit();
+
+    const result = svc.readShot(targetRef('t1', '10.0.1.11'), 5);
+    queueMicrotask(() =>
+      frames.next(
+        inbound('10.0.1.11', CMD_HIT, [6, 0, 0, 0, 0], { rawX: 100, rawY: 100 }),
+      ),
+    );
+
+    const { rawX, exchange } = await result;
+    expect(exchange.ok).toBe(false);
+    expect(exchange.rxHex).toBeNull();
+    expect(rawX).toBeNull();
+    svc.onModuleDestroy();
+  });
+
+  it('readShot() reports no reply when the firmware ignores the read', async () => {
+    // The whole point of the diagnostic route: a board that does not implement
+    // 'L' reads must be distinguishable from one that had nothing to send.
+    const { registry } = makeFakeRegistry();
+    const svc = new TargetCommandService(registry, makeFakeConfig(FAST_CONFIG));
+    svc.onModuleInit();
+
+    const { exchange } = await svc.readShot(targetRef('t1', '10.0.1.11'), 5);
+
+    expect(exchange.ok).toBe(false);
+    expect(exchange.txHex).toBe('24 4C 05 00 00 00 00 75 23');
+    expect(exchange.rxHex).toBeNull();
     svc.onModuleDestroy();
   });
 });

@@ -2,9 +2,12 @@ import { describe, expect, it } from 'vitest';
 
 import {
   buildGetWiperFrame,
+  buildHitFrame,
+  buildReadShotFrame,
   buildSelfTestFrame,
   buildWriteWiperFrame,
   CMD_GET_WIPER,
+  CMD_HIT,
   CMD_SELF_TEST,
   decodeDatagram,
   decodeFrame,
@@ -86,6 +89,49 @@ describe('frame.codec — wiper/self-test opcodes', () => {
     // failure with a misleading reason.
     const result = decodeFrame(hexToBuffer('24 99 00 00 00 00 00 00 23'));
     expect(result).toEqual({ ok: false, reason: 'UNKNOWN_COMMAND' });
+  });
+});
+
+describe('frame.codec — read-shot request', () => {
+  // The spec's own worked example, verbatim:
+  //
+  //   reading a specific shot:
+  //   Tx: 0x24 'L' 5 0 0 0 0 crc 0x23
+  //
+  // 'L' (0x4C), not 'R' (0x52). 'R' is listed in the same document as "Read
+  // Params (not implemented)" — it was what this request used to be built with,
+  // and the board discarded every one silently.
+
+  it('builds the documented read-shot frame for shot 5', () => {
+    // crc = 0x24 + 0x4C + 0x05 = 0x75
+    expect(buildReadShotFrame(5)).toEqual(
+      hexToBuffer('24 4C 05 00 00 00 00 75 23'),
+    );
+  });
+
+  it('uses the hit opcode, because the reply is an ordinary hit frame', () => {
+    expect(buildReadShotFrame(5)[1]).toBe(CMD_HIT);
+  });
+
+  it('masks the shot number to one byte, like the wire counter', () => {
+    expect(buildReadShotFrame(261)).toEqual(buildReadShotFrame(5));
+  });
+
+  it('is byte-identical to a no-detection hit for the same shot', () => {
+    // Not a curiosity — this is why SensorService needs an echo guard. A board
+    // that echoes commands (it echoes P/S/H/T/W) produces a frame nothing in
+    // the bytes can distinguish from a real miss, so only arrival timing can.
+    expect(buildReadShotFrame(5)).toEqual(buildHitFrame(0, 0, 5));
+  });
+
+  it('decodes inbound as a hit — there is no separate reply opcode', () => {
+    const result = decodeFrame(hexToBuffer('24 4C 05 01 0D 09 41 CD 23'));
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.frame.command).toBe(CMD_HIT);
+    expect(result.frame.bulletCounter).toBe(5);
+    expect(result.frame.rawX).toBe(269);
+    expect(result.frame.rawY).toBe(2369);
   });
 });
 
