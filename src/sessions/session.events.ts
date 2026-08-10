@@ -28,6 +28,9 @@ export interface SessionPausedEvent extends BaseSessionEvent {
 export interface SessionResumedEvent extends BaseSessionEvent {
     type: 'session:resumed';
     totalPausedMs: number;
+    /** The re-armed target, so listeners can reset per-target ingest state.
+     *  Undefined only if the session was resumed with no ACTIVE stage. */
+    targetId?: string;
 }
 
 export interface SessionAdvancedEvent extends BaseSessionEvent {
@@ -35,6 +38,9 @@ export interface SessionAdvancedEvent extends BaseSessionEvent {
     fromStageId: string;
     toStageId?: string;
     toStageOrder?: number;
+    /** The newly armed target. Undefined on the final advance, which ends the
+     *  session rather than arming anything. Same purpose as on resume. */
+    targetId?: string;
 }
 
 export interface SessionCompletedEvent extends BaseSessionEvent {

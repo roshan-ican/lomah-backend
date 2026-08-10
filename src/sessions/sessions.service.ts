@@ -15,7 +15,8 @@ import { Prisma } from '@prisma/client';
 
 import { PrismaService } from '@/common/prisma/prisma.service';
 import { TargetCommandService } from '@/transport/target-command.service';
-import { scoreForRadius } from "@/sensor/scoring";
+import { SequenceTracker } from '@/transport/protocol/sequence.tracker';
+import { scoreAt } from "@/sensor/scoring";
 
 
 type PrismaTx = Prisma.TransactionClient;
@@ -59,6 +60,7 @@ export class SessionsService implements OnModuleDestroy {
   constructor(
     private readonly prisma: PrismaService,
     private readonly targetCommand: TargetCommandService,
+    private readonly sequenceTracker: SequenceTracker,
     config: ConfigService,
   ) {
     this.requireAck =
@@ -390,6 +392,7 @@ export class SessionsService implements OnModuleDestroy {
       fromStageId: current.id,
       toStageId: next?.id,
       toStageOrder: next?.order,
+      targetId: next?.targetId,
     });
     if (!next) {
       this.events.next({
@@ -507,14 +510,61 @@ export class SessionsService implements OnModuleDestroy {
       laneId: session.laneId,
       sessionId: id,
       totalPausedMs: session.totalPausedMs + Math.max(0, pausedMs),
+      targetId: current?.targetId,
     });
 
     return this.findOne(id);
   }
 
 
+  /** Already over — ending one again is a no-op, not an error. See end(). */
+  private static readonly TERMINAL_STATUSES = [
+    'COMPLETED',
+    'CANCELLED',
+    'SUPERSEDED',
+  ] as const;
+
   async end(id: string) {
     const session = await this.findOne(id);
+
+    // Ending a session that is already finished is idempotent.
+    //
+    // The case that forced this: a server restart marks every interrupted
+    // session SUPERSEDED (see SessionRecoveryService), but an admin console
+    // that was open across the restart still has the session on its lane and
+    // still offers End. Pressing it returned 400 "is SUPERSEDED and cannot be
+    // ended" — an error the operator can neither act on nor clear, on a lane
+    // the server had already released.
+    //
+    // Re-emitting session:completed is the point of doing this rather than
+    // just returning: it is what tells every connected client to vacate the
+    // lane, so the dead session actually leaves the grid instead of sitting
+    // there until the next refresh.
+    if (
+      (SessionsService.TERMINAL_STATUSES as readonly string[]).includes(
+        session.status,
+      )
+    ) {
+      this.logger.warn(
+        `End requested for ${session.status} session ${id} (lane ${session.laneId}) — ` +
+          `already closed, re-announcing so stale clients release the lane.`,
+      );
+      this.events.next({
+        type: 'session:completed',
+        laneId: session.laneId,
+        sessionId: id,
+        // The real status is carried through rather than flattened to
+        // COMPLETED: a session the server superseded did not finish the way an
+        // operator-ended one did, and a client — or a later reader of this
+        // event — should be able to tell the two apart.
+        status: session.status,
+        endedAt: session.endedAt ?? new Date(),
+      });
+      return session;
+    }
+
+    // CREATED is NOT terminal: the session was assigned but never started, and
+    // "end" is the wrong verb for it — cancel() is. Still an error.
     if (session.status !== 'ACTIVE' && session.status !== 'PAUSED') {
       throw new BadRequestException(
         `Session ${id} is ${session.status} and cannot be ended.`,
@@ -628,7 +678,7 @@ export class SessionsService implements OnModuleDestroy {
 
     // The stage's profile snapshot, same rule as SensorService.persistHit — not
     // target.profileType, which may have changed since this stage was fired.
-    const score = scoreForRadius(Math.hypot(x, y), stage.profileType);
+    const score = scoreAt(x, y, stage.profileType);
 
     // A manual drag repositions a shot that WAS detected. Whatever the sensor
     // originally reported, it is no longer "no detection" after this.
@@ -684,9 +734,26 @@ export class SessionsService implements OnModuleDestroy {
   private async arm(laneId: number, targetId: string): Promise<void> {
     const target = await this.targetRef(laneId, targetId);
     const acked = await this.targetCommand.play(target);
-    if (acked) return;
+
+    // A fresh PLAY starts a new relay — any bullet numbers the tracker is
+    // still holding belong to whatever ran before this session (a bench test,
+    // a prior relay, an unrelated self-test) and must not poison gap detection
+    // here. Without this, the first shot of a session was measured against a
+    // stale anchor and every number in between was reported missing, so the
+    // board was chased for resends of bullets nobody had fired.
+    //
+    // Done on BOTH exits that let the stage go live, not just the acked one:
+    // an unacked target under SENSOR_REQUIRE_ACK=false still ends up ACTIVE
+    // and can still deliver shots, so it needs the same clean slate. The
+    // matching reset for SensorService's in-flight resend chases rides on the
+    // session events it already subscribes to — see SensorService.resetTarget.
+    if (acked) {
+      this.sequenceTracker.reset(targetId);
+      return;
+    }
 
     if (!this.requireAck) {
+      this.sequenceTracker.reset(targetId);
       this.logger.warn(
         `${target.label} never acknowledged PLAY — continuing anyway ` +
           `(SENSOR_REQUIRE_ACK=false).`,

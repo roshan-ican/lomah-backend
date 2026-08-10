@@ -6,12 +6,41 @@
  * this" call at each interesting site — is what makes SensorService's per-shot
  * lines, TargetCommandService's PLAY handshake, and everything else show up
  * without touching those services at all.
+ *
+ * The console format is the stock one except for the timestamp (see below).
+ * The broadcast copy is unaffected: `pushServerLog` sends a full ISO string and
+ * the admin console formats it itself.
  */
 import { ConsoleLogger } from '@nestjs/common';
 
 import { pushServerLog, type ServerLogLevel } from './server-log.stream';
 
+/**
+ * Time only — no date, and 24-hour so the AM/PM goes too.
+ *
+ * Nest's default stamps every line with the full date ("10/08/2026, 11:20:16
+ * AM"), which is eleven constant characters in front of the part that changes.
+ * A range session is read within the day it happened, and the date is still on
+ * the file itself, so it earns nothing per-line.
+ *
+ * Milliseconds are added rather than dropped: the timing questions these logs
+ * get asked — how long a PLAY handshake took, whether two shots arrived inside
+ * the resend grace window — happen well under a second, and second resolution
+ * cannot answer them.
+ */
+const TIME_ONLY = new Intl.DateTimeFormat(undefined, {
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+  fractionalSecondDigits: 3,
+  hour12: false,
+});
+
 export class BroadcastLogger extends ConsoleLogger {
+  protected getTimestamp(): string {
+    return TIME_ONLY.format(Date.now());
+  }
+
   log(message: unknown, ...rest: unknown[]): void {
     super.log(message as string, ...(rest as string[]));
     this.tee('log', message, rest);

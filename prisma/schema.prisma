@@ -157,6 +157,32 @@ model Session {
   pausedAt      DateTime?
   totalPausedMs Int       @default(0)
 
+  /// How many times this session's target has been calibrated.
+  ///
+  /// Drives the single-shot-then-bulk rule: the FIRST calibration of a session
+  /// is the one-bullet "pick" (mark one hole as true centre), and every
+  /// calibration after it in the same session is a bulk group drag. Held on
+  /// the session rather than in the browser because the console that did the
+  /// first calibration is not necessarily the one asking — a page refresh, a
+  /// backend restart, or a second admin screen all used to get offered pick
+  /// again on an already-calibrated lane.
+  ///
+  /// Resets naturally: a new session is a new row, starting at 0.
+  calibrationCount Int @default(0)
+
+  /// Whether the one-bullet "pick" calibration has been spent on this session.
+  ///
+  /// Separate from calibrationCount on purpose. The count rises on ANY offset
+  /// write — a bulk group drag, a hand-typed offset, a reset to zero — so
+  /// gating pick on `count === 0` had it consumed by a reset performed before
+  /// the operator had calibrated anything at all. This flag is set by exactly
+  /// one operation, calibrateFromShot, and nothing in the session's lifetime
+  /// clears it: resetting the offset to zero deliberately does NOT hand pick
+  /// back, because the shot it would key off has already been re-scored once.
+  ///
+  /// One pick per session, and only a new session restores it.
+  pickCalibrationUsed Boolean @default(false)
+
   notes     String?
   feedback  String?
   createdBy String?
