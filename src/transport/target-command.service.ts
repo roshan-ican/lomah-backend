@@ -39,35 +39,16 @@ interface Waiter<T = unknown> {
 }
 
 export interface FrameExchange {
-  /** True if the board answered the request within budget. For STOP, which is
-   *  fire-and-forget at the transport, this reports whether an echo arrived —
-   *  not whether the disarm happened (it was sent regardless). */
+
   ok: boolean;
-  /** ASCII command byte that was sent — P/S/T/H/D/G/W. */
   command: string;
-  /** The exact 9-byte frame sent, space-separated uppercase hex. */
   txHex: string;
-  /** The board's reply frame, space-separated uppercase hex, or null if it
-   *  never answered within budget. */
   rxHex: string | null;
-  /**
-   * Milliseconds between putting the winning attempt on the wire and the reply
-   * arriving, or null if there was no reply.
-   *
-   * Carried out of the transport because for read-shot it is load-bearing, not
-   * diagnostic: a board with nothing stored for a bullet answers with the exact
-   * bytes it was asked with, so round-trip time is the only thing separating
-   * "no position for that shot" from "this firmware just echoes commands".
-   * See ECHO_WINDOW_MS.
-   */
   elapsedMs: number | null;
-  /** Human-readable summary, including what to check on failure. */
   message: string;
 }
 
-/** A wiper page read/write plus the round trip that produced it. */
 export interface WiperRead {
-  /** The five wiper values (0-255), as the board reported them. */
   values: number[];
   exchange: FrameExchange;
 }
@@ -77,7 +58,6 @@ export interface WiperRead {
 export class TargetCommandService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(TargetCommandService.name);
 
-  /** sourceKey → FIFO of requests currently awaiting a reply from that board. */
   private readonly waiters = new Map<string, Waiter[]>();
   private readonly queues = new Map<string, Promise<unknown>>();
   private readonly wiperQuarantineUntil = new Map<string, number>();
@@ -156,16 +136,7 @@ export class TargetCommandService implements OnModuleInit, OnModuleDestroy {
     await this.registry.send(target, buildStopFrame());
   }
 
-  /**
-   * Ask a board to send one shot again — fire-and-forget, no waiter.
-   *
-   * Deliberately outside the request/once retry wrapper that every other
-   * command uses. The reply is an ordinary 'L' hit frame, which SensorService
-   * must ingest through its own sequence/slot machinery; latching a waiter onto
-   * it here would settle on whichever 'L' arrived first, including a live shot
-   * from the shooter. Retries are SensorService's job — it is the only place
-   * that knows whether the bullet has since turned up.
-   */
+
   async readShotRequest(target: TargetRef, shot: number): Promise<void> {
     const frame = buildReadShotFrame(shot);
 
@@ -174,19 +145,15 @@ export class TargetCommandService implements OnModuleInit, OnModuleDestroy {
       `frame=[${frame.toString('hex').match(/../g)?.join(' ')}]`,
     );
 
-    await this.registry.send(target, frame);
+    console.time(`Send read #${shot} -> ${target.label}`);
+
+    // await this.registry.send(target, frame);
+    await this.enqueue(sourceKeyOf(target), () => this.registry.send(target, frame))
+
+    console.timeEnd(`Send read #${shot} -> ${target.label}`);
   }
 
-  /**
-   * One read-shot round trip with the raw bytes kept — the commissioning
-   * console's way of answering "does this firmware implement the read at all?"
-   * without needing a live relay to produce a gap first.
-   *
-   * Unlike readShotRequest this DOES wait for a reply, which is only safe
-   * because the route behind it refuses to run mid-relay: the match is on
-   * command + bullet counter, and during sustained fire a real shot carrying
-   * that counter would settle the waiter just as well as an answer would.
-   */
+
   async readShot(
     target: TargetRef,
     shot: number,
@@ -259,10 +226,6 @@ export class TargetCommandService implements OnModuleInit, OnModuleDestroy {
         command: 'G',
         txHex: formatFrame(frame),
         rxHex: formatFrame(Buffer.from(reply.bytes)),
-        // Wiper reads go through `request` directly rather than `exchange`, and
-        // nothing downstream distinguishes a wiper reply from an echo — a 'G'
-        // answer carries five values, so it is never byte-identical to the
-        // request that asked for it.
         elapsedMs: null,
         message: `${label} — ${values.join(', ')}`,
       },
@@ -296,7 +259,6 @@ export class TargetCommandService implements OnModuleInit, OnModuleDestroy {
     });
   }
 
-  /** Ask the board whether it is alive: send 'H', wait for the echo. */
   async heartbeat(target: TargetRef): Promise<FrameExchange> {
     return this.exchange(target, buildHeartbeatFrame(), {
       label: 'HEARTBEAT',
@@ -304,11 +266,7 @@ export class TargetCommandService implements OnModuleInit, OnModuleDestroy {
     });
   }
 
-  /**
-   * 'D' — developer per-shot diagnostic. The reply's byte[2] is a bitmask of
-   * which sensors detected the requested shot; that is decoded and returned
-   * alongside the raw bytes.
-   */
+
   async devData(
     target: TargetRef,
     shot: number,
@@ -325,8 +283,7 @@ export class TargetCommandService implements OnModuleInit, OnModuleDestroy {
     return { sensors, exchange };
   }
 
-  /** Self-test round trip that keeps the raw bytes — the decoded outcome plus
-   *  the actual frame exchanged, for the commissioning console's packet log. */
+
   async selfTestExchange(
     target: TargetRef,
   ): Promise<{ reply: SelfTestReply | undefined; exchange: FrameExchange }> {
@@ -349,9 +306,7 @@ export class TargetCommandService implements OnModuleInit, OnModuleDestroy {
     opts: { label: string; match: (f: InBoundFrame) => boolean },
   ): Promise<FrameExchange> {
     let reply: InBoundFrame | undefined;
-    // Stamped per attempt, not once for the whole exchange: `enqueue` can park
-    // this behind another command for arbitrarily long, and `request` may retry.
-    // Only the gap between the winning send and its reply says anything.
+
     let sentAt = 0;
     let elapsedMs: number | null = null;
     const result = await this.enqueue(sourceKeyOf(target), () =>
@@ -449,8 +404,6 @@ export class TargetCommandService implements OnModuleInit, OnModuleDestroy {
       list.push(waiter as Waiter);
       this.waiters.set(key, list);
 
-      // Before the send, not after: the echo this timestamp exists to detect
-      // can be back inside a millisecond on a direct AP link.
       onSend?.();
 
       this.registry.send(target, frame).catch((err: Error) => {

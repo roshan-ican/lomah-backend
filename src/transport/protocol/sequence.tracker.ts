@@ -1,47 +1,14 @@
-/**
- * Wrap-safe per-target bullet sequence tracking.
- *
- * PORTED from `backend/services/sensor-sequence.ts`, with one change: state is
- * keyed by TARGET id rather than lane id, because a lane now holds several
- * targets and each carries its own counter.
- *
- * The comment that follows is the single most expensive lesson in the original
- * codebase — keep it:
- *
- *   The sensor's bullet counter is a single byte (frame offset [2]), so it
- *   rolls over every 256 shots. Deduplicating on that raw byte silently
- *   discards every shot past the first wrap: bullet 0 of the second lap
- *   collides with bullet 0 of the first and is rejected as a duplicate for the
- *   rest of the session.
- *
- * This class unwraps the byte into a monotonic absolute sequence, dedups on
- * that, and reports which numbers were skipped so the caller can ask the target
- * to resend them.
- *
- * Deliberately pure — no I/O, no sockets, no Nest decorators — so it can be
- * exercised by a plain test and can never create a circular import with the
- * transport layer. Gap detection over LoRa matters MORE than over WiFi, since
- * LoRa has no link-layer retry to hide losses.
- */
 
 const RANGE = 256;
-/** A jump larger than half the range is a rollover, not ordinary reordering. */
 const HALF = RANGE / 2;
-/** How far back individual numbers are kept for duplicate detection. */
 const SEEN_WINDOW = 128;
-
 interface TargetState {
-  /** Highest absolute seen; the anchor every new byte is resolved against. */
   maxAbsolute: number | undefined;
   seen: Set<number>;
 }
-
 export interface Observation {
-  /** Monotonic sequence number, continuous across byte rollovers. */
   absolute: number;
-  /** This exact bullet has already been processed for this target. */
   duplicate: boolean;
-  /** Absolute numbers skipped by this observation, ascending. */
   gaps: number[];
 }
 

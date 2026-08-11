@@ -27,5 +27,6 @@
   },
   "peacock.color": "#215732",
   "git.openRepositoryInParentFolders": "never",
-  "gitlens.autoRepositoryDetection": false
+  "gitlens.autoRepositoryDetection": false,
+  "claudeCodeChat.permissions.yoloMode": true
 }

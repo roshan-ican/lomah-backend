@@ -17,13 +17,7 @@ import {
   type TransportKind,
 } from "./target-transport.interface";
 
-/**
- * Read a numeric setting that dotenv has turned into a string.
- *
- * Falls back rather than propagating a NaN: a mistyped port would otherwise
- * reach `socket.bind()` as NaN and bind an arbitrary ephemeral port, which
- * looks like a working server that no board can reach.
- */
+
 function numberFrom(
   config: ConfigService,
   key: string,
@@ -35,8 +29,7 @@ function numberFrom(
 
 @Injectable()
 export class WifiUdpTransport
-  implements TargetTransport, OnModuleInit, OnModuleDestroy
-{
+  implements TargetTransport, OnModuleInit, OnModuleDestroy {
   readonly kind: TransportKind = "WIFI";
 
   private readonly logger = new Logger(WifiUdpTransport.name);
@@ -51,20 +44,6 @@ export class WifiUdpTransport
   private readonly recvBuffer: number;
 
   constructor(config: ConfigService) {
-    // Number(), not config.get<number>(). The generic is a TYPE ASSERTION, not
-    // a conversion — ConfigService hands back whatever dotenv parsed, and dotenv
-    // parses everything as a string. So `get<number>('SENSOR_UDP_RECV_BUFFER')`
-    // returns the string "1048576" while TypeScript is told it is a number, and
-    // nothing complains until something downstream actually does arithmetic or
-    // a runtime type check on it.
-    //
-    // The ports survived that lie because dgram coerces them. setRecvBufferSize
-    // does not: it validates, throws "Buffer size must be a positive integer",
-    // and the throw was swallowed by the catch below as a warning nobody read.
-    // The socket then ran on the 64KB OS default instead of the 1MB configured
-    // — and a full receive buffer drops datagrams SILENTLY, with no error and
-    // no event, which is indistinguishable in the logs from a board that never
-    // sent the shot. Hunting those phantom gaps is what led here.
     this.listenPort = numberFrom(config, "SENSOR_UDP_LISTEN_PORT", 14555);
     this.targetPort = numberFrom(config, "SENSOR_UDP_TARGET_PORT", 14550);
     this.recvBuffer = numberFrom(config, "SENSOR_UDP_RECV_BUFFER", 1 << 20);
@@ -83,31 +62,35 @@ export class WifiUdpTransport
     });
 
     socket.on("listening", () => {
-      // One socket carries every lane. The default buffer overflows under
-      // sustained fire and drops datagrams silently — no error, no event.
       try {
         socket.setRecvBufferSize(this.recvBuffer);
       } catch (err) {
-        // error(), not warn(). Losing this call costs shots off the wire with
-        // no other symptom anywhere, so it must not sit in the log looking like
-        // housekeeping — which is exactly how it went unnoticed.
         this.logger.error(
           `could not raise recv buffer to ${this.recvBuffer}: ` +
-            `${(err as Error).message}. The socket is running on the OS default, ` +
-            `and datagrams that overflow it are dropped silently — shots will go ` +
-            `missing with nothing in this log to say so.`,
+          `${(err as Error).message}. The socket is running on the OS default, ` +
+          `and datagrams that overflow it are dropped silently — shots will go ` +
+          `missing with nothing in this log to say so.`,
         );
       }
+
       this.ready = true;
+
       const a = socket.address();
       const actual = socket.getRecvBufferSize();
-      this.logger.log(
-        `listening ${a.address}:${a.port} (rcvbuf ${actual}` +
-          // Kernels are free to grant less than asked. Silence about that is
-          // how a "1MB buffer" turns out to be 64KB under sustained fire.
-          (actual < this.recvBuffer ? `, asked for ${this.recvBuffer}` : '') +
-          `)`,
-      );
+
+      if (actual < this.recvBuffer) {
+        this.logger.warn(
+          `UDP listening ${a.address}:${a.port} | ` +
+          `requested rcvbuf=${this.recvBuffer} bytes | ` +
+          `actual rcvbuf=${actual} bytes — OS granted less than requested.`,
+        );
+      } else {
+        this.logger.log(
+          `UDP listening ${a.address}:${a.port} | ` +
+          `requested rcvbuf=${this.recvBuffer} bytes | ` +
+          `actual rcvbuf=${actual} bytes`,
+        );
+      }
     });
 
     socket.on("message", (msg, rinfo) => {
