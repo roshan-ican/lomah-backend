@@ -57,6 +57,21 @@ export class SessionsService implements OnModuleDestroy {
    *  Off only for bench work with no hardware attached. */
   private readonly requireAck: boolean;
 
+  /**
+   * targetId -> the stage it's currently armed for, known the instant PLAY is
+   * acked in arm() — before any network round trip for a shot could even
+   * begin, and well before the DB transaction that flips that stage's status
+   * to ACTIVE actually commits.
+   *
+   * persistHit() (SensorService) reads this to find the right stage by id
+   * instead of querying `status: 'ACTIVE'`, which raced that transaction: a
+   * board can report a shot as soon as it echoes PLAY, but its stage's status
+   * column doesn't flip until a separate, later write. Looking the row up by
+   * id sidesteps that entirely — the row has existed since the stage was
+   * created, long before this arm.
+   */
+  private readonly armedStageByTarget = new Map<string, string>();
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly targetCommand: TargetCommandService,
@@ -321,7 +336,7 @@ export class SessionsService implements OnModuleDestroy {
     // ack and retries, which is seconds of network I/O. Holding a write
     // transaction (and, on SQLite, a write lock) open for that would stall
     // every other lane. Nothing is written until the target answers.
-    await this.arm(session.laneId, first.targetId);
+    await this.arm(session.laneId, first.targetId, first.id);
 
     const now = new Date();
     await this.prisma.$transaction(async (tx) => {
@@ -361,7 +376,7 @@ export class SessionsService implements OnModuleDestroy {
     // lane is left quiet rather than still scoring against the old target.
     await this.disarm(session.laneId, current.targetId);
     if (next) {
-      await this.arm(session.laneId, next.targetId);
+      await this.arm(session.laneId, next.targetId, next.id);
     }
 
     await this.prisma.$transaction(async (tx) => {
@@ -493,7 +508,7 @@ export class SessionsService implements OnModuleDestroy {
     // ACTIVE with a disarmed target — the shooter fires into a dead lane.
     // The original backend threw here too (session.manager.ts resume path).
     if (current) {
-      await this.arm(session.laneId, current.targetId);
+      await this.arm(session.laneId, current.targetId, current.id);
     }
 
     await this.prisma.session.update({
@@ -718,6 +733,13 @@ export class SessionsService implements OnModuleDestroy {
     });
   }
 
+  /** Which stage `targetId` is currently armed for, if any. See
+   *  armedStageByTarget above for why persistHit() should trust this over a
+   *  `status: 'ACTIVE'` query. */
+  getArmedStageId(targetId: string): string | undefined {
+    return this.armedStageByTarget.get(targetId);
+  }
+
   /**
    * The HARDWARE half: tell the board to start scoring, and REFUSE TO PROCEED
    * if it does not answer.
@@ -731,29 +753,19 @@ export class SessionsService implements OnModuleDestroy {
    * attached. It defaults to ON: silently arming a lane nothing is listening
    * to is the failure mode that loses a shooter's whole relay.
    */
-  private async arm(laneId: number, targetId: string): Promise<void> {
+  private async arm(laneId: number, targetId: string, stageId: string): Promise<void> {
     const target = await this.targetRef(laneId, targetId);
     const acked = await this.targetCommand.play(target);
 
-    // A fresh PLAY starts a new relay — any bullet numbers the tracker is
-    // still holding belong to whatever ran before this session (a bench test,
-    // a prior relay, an unrelated self-test) and must not poison gap detection
-    // here. Without this, the first shot of a session was measured against a
-    // stale anchor and every number in between was reported missing, so the
-    // board was chased for resends of bullets nobody had fired.
-    //
-    // Done on BOTH exits that let the stage go live, not just the acked one:
-    // an unacked target under SENSOR_REQUIRE_ACK=false still ends up ACTIVE
-    // and can still deliver shots, so it needs the same clean slate. The
-    // matching reset for SensorService's in-flight resend chases rides on the
-    // session events it already subscribes to — see SensorService.resetTarget.
     if (acked) {
       this.sequenceTracker.reset(targetId);
+      this.armedStageByTarget.set(targetId, stageId);
       return;
     }
 
     if (!this.requireAck) {
       this.sequenceTracker.reset(targetId);
+      this.armedStageByTarget.set(targetId, stageId);
       this.logger.warn(
         `${target.label} never acknowledged PLAY — continuing anyway ` +
           `(SENSOR_REQUIRE_ACK=false).`,
@@ -768,6 +780,10 @@ export class SessionsService implements OnModuleDestroy {
   }
 
   private async disarm(laneId: number, targetId: string): Promise<void> {
+    // Cleared here rather than only on the next arm(): advance()'s final
+    // stage has no "next" to overwrite this entry, so a session that ends
+    // outright would otherwise leave a stale target -> stage mapping behind.
+    this.armedStageByTarget.delete(targetId);
     try {
       await this.targetCommand.stop(await this.targetRef(laneId, targetId));
     } catch (err) {

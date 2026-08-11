@@ -135,6 +135,10 @@ function harness({
     {
       events$: { subscribe: vi.fn() },
       advance: vi.fn(async (id: string) => void advanced.push(id)),
+      // Not under test here — undefined sends persistHit down the existing
+      // status: 'ACTIVE' path, which prisma.sessionStage.findFirst above
+      // already fakes.
+      getArmedStageId: vi.fn(() => undefined),
     } as any,
     { setHeld: vi.fn() } as any,
     config as any,
