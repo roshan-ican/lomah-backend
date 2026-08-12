@@ -53,6 +53,8 @@ export interface ScoredShot {
   y: number;
   score: number;
   isMiss: boolean;
+  sensorX?: number;
+  sensorY?: number;
 }
 
 /**
@@ -166,18 +168,29 @@ export function scoreShot(params: {
     return { x: 0, y: 0, score: 0, isMiss: true };
   }
 
-  const x = toSigned16(rawX) + offsetXmm;
-  const y = toSigned16(rawY) - SENSOR_Y_FLOOR_BIAS_MM + offsetYmm;
+
+  const sensorX = toSigned16(rawX);
+  const sensorY = toSigned16(rawY) - SENSOR_Y_FLOOR_BIAS_MM;
+
+  const x = sensorX + offsetXmm;
+  const y = sensorY + offsetYmm;
 
   // A shot off the face scores zero but is NOT a miss: the sensor located this
   // bullet, and the coordinates are real and worth keeping — the shooter can
   // see they went wide right rather than being told nothing was detected.
   // isMiss is reserved for the sentinel case, where there are no coordinates
   // at all.
+  //
+  // No rounding: every term above is an integer. rawX/rawY arrive as uint16
+  // from the wire and the offsets are INTEGER columns, so a fractional
+  // millimetre cannot arise here, and rounding would only hide it if one ever
+  // did.
   return {
-    x: Math.round(x),
-    y: Math.round(y),
+    x,
+    y,
     score: scoreAt(x, y, profile),
     isMiss: false,
+    sensorX,
+    sensorY,
   };
 }

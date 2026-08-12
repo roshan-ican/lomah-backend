@@ -67,6 +67,8 @@ export interface ShotCalibratedEvent extends BaseSessionEvent {
     shotNumber: number;
     x: number;
     y: number;
+    sensorXmm?: number;
+    sensorYmm?: number;
     score: number;
 }
 

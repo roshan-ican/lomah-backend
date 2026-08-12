@@ -171,6 +171,28 @@ describe('TargetCommandService', () => {
     svc.onModuleDestroy();
   });
 
+  it('a GET-WIPER whose first attempt times out is still answered by the retry', async () => {
+    const { registry, frames, send } = makeFakeRegistry();
+    const svc = new TargetCommandService(registry, makeFakeConfig(FAST_CONFIG));
+    svc.onModuleInit();
+
+    const target = targetRef('t1', '10.0.1.11');
+    const read = svc.getWiperPage(target, 'A');
+
+    // Let attempt 1's whole budget lapse unanswered, then reply. Attempt 2 put
+    // a byte-identical frame on the wire, so this IS its answer — whether it
+    // is also attempt 1's straggler is unknowable and does not matter.
+    await new Promise((r) => setTimeout(r, FAST_CONFIG.SENSOR_REQUEST_TIMEOUT_MS + 20));
+    expect(send).toHaveBeenCalledTimes(2);
+    frames.next(inbound('10.0.1.11', CMD_GET_WIPER, [10, 30, 10, 10, 11]));
+
+    expect(await read).toEqual({
+      values: [10, 30, 10, 10, 11],
+      exchange: expect.objectContaining({ command: 'G' }),
+    });
+    svc.onModuleDestroy();
+  });
+
   it('stop() cancels a PLAY that is still in flight rather than leaving it hanging', async () => {
     const { registry } = makeFakeRegistry();
     const svc = new TargetCommandService(registry, makeFakeConfig(FAST_CONFIG));

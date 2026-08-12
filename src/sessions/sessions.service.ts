@@ -711,6 +711,8 @@ export class SessionsService implements OnModuleDestroy {
       shotNumber: updated.shotNumber,
       x: updated.x,
       y: updated.y,
+      sensorXmm: updated.sensorXmm ?? undefined,
+      sensorYmm: updated.sensorYmm ?? undefined,
       score: updated.score,
     });
 

@@ -60,7 +60,7 @@ export class TargetCommandService implements OnModuleInit, OnModuleDestroy {
 
   private readonly waiters = new Map<string, Waiter[]>();
   private readonly queues = new Map<string, Promise<unknown>>();
-  private readonly wiperQuarantineUntil = new Map<string, number>();
+  private readonly staleWiperReplies = new Map<string, number[]>();
 
   private sub?: Subscription;
 
@@ -107,7 +107,7 @@ export class TargetCommandService implements OnModuleInit, OnModuleDestroy {
     }
     this.waiters.clear();
     this.queues.clear();
-    this.wiperQuarantineUntil.clear();
+    this.staleWiperReplies.clear();
   }
 
   async play(target: TargetRef): Promise<boolean> {
@@ -201,35 +201,80 @@ export class TargetCommandService implements OnModuleInit, OnModuleDestroy {
   ): Promise<WiperRead | undefined> {
     const key = sourceKeyOf(target);
     let reply: InBoundFrame | undefined;
-    const result = await this.enqueue(key, () =>
-      this.request(target, frame, {
+    let timedOutAttempts = 0;
+    const result = await this.enqueue(key, () => {
+      // Ghosts are counted once, when this request starts, and only ever come
+      // from an EARLIER request. A retry inside this request puts a
+      // byte-identical frame back on the wire, so a late reply to attempt 1 is
+      // a perfectly good answer for attempt 2 — discarding it would make the
+      // retry structurally incapable of succeeding, which is exactly what a
+      // time-window quarantine here used to do.
+      let ghosts = this.takeStaleWiperReplies(key);
+      return this.request(target, frame, {
         match: (f) => {
           if (f.command !== CMD_GET_WIPER) return undefined;
-          const quarantineUntil = this.wiperQuarantineUntil.get(key);
-          if (quarantineUntil !== undefined && Date.now() < quarantineUntil) {
-            return undefined;
+          if (ghosts > 0) {
+            ghosts--;
+            return undefined; // an abandoned request's reply, not ours
           }
           reply = f;
           return true;
         },
+        onTimeout: () => {
+          timedOutAttempts++;
+        },
         label,
         timeoutMs: this.requestTimeoutMs,
         attempts: this.requestAttempts,
-      }),
-    );
-    if (result !== true || !reply) return undefined;
+      });
+    });
+    if (result !== true || !reply) {
+      // Nothing was ever accepted, so every unanswered attempt is still a
+      // possible late reply. Recorded only on total failure: after a success
+      // the reply we took may well have been the straggler, and assuming
+      // otherwise would cost the next request a needless timeout.
+      this.recordStaleWiperReplies(key, timedOutAttempts);
+      this.logger.warn(
+        `${label} → ${target.label} (${target.ipAddress}) unanswered after ` +
+          `${this.requestAttempts} attempt(s) of ${this.requestTimeoutMs}ms — ` +
+          `tx=[${formatFrame(frame)}]`,
+      );
+      return undefined;
+    }
     const values = decodeWiperPage(reply.payload);
+    const rxHex = formatFrame(Buffer.from(reply.bytes));
+    this.logger.log(`${label} → ${target.label}: ${values.join(', ')} rx=[${rxHex}]`);
     return {
       values,
       exchange: {
         ok: true,
         command: 'G',
         txHex: formatFrame(frame),
-        rxHex: formatFrame(Buffer.from(reply.bytes)),
+        rxHex,
         elapsedMs: null,
         message: `${label} — ${values.join(', ')}`,
       },
     };
+  }
+
+  /** Ghost replies still owed to abandoned wiper requests on this key, expired
+   *  ones dropped. Reading them hands ownership to the caller. */
+  private takeStaleWiperReplies(key: string): number {
+    const deadlines = this.staleWiperReplies.get(key);
+    if (!deadlines?.length) return 0;
+    this.staleWiperReplies.delete(key);
+    const now = Date.now();
+    return deadlines.filter((deadline) => deadline > now).length;
+  }
+
+  private recordStaleWiperReplies(key: string, count: number): void {
+    if (count <= 0) return;
+    // One request timeout of grace: past that a reply is assumed lost for
+    // good, so a board that was simply offline never poisons the next read.
+    const deadline = Date.now() + this.requestTimeoutMs;
+    const deadlines = this.staleWiperReplies.get(key) ?? [];
+    for (let i = 0; i < count; i++) deadlines.push(deadline);
+    this.staleWiperReplies.set(key, deadlines);
   }
 
   async selfTest(target: TargetRef): Promise<SelfTestReply | undefined> {
@@ -359,6 +404,10 @@ export class TargetCommandService implements OnModuleInit, OnModuleDestroy {
       attempts: number;
       /** Called immediately before each attempt goes on the wire. */
       onSend?: () => void;
+      /** Called once per attempt that reached the wire and went unanswered.
+       *  Not called when the send itself failed — nothing was asked, so
+       *  nothing can answer late. */
+      onTimeout?: () => void;
     },
   ): Promise<T | undefined> {
     for (let attempt = 1; attempt <= opts.attempts; attempt++) {
@@ -368,6 +417,7 @@ export class TargetCommandService implements OnModuleInit, OnModuleDestroy {
         opts.match,
         opts.timeoutMs,
         opts.onSend,
+        opts.onTimeout,
       );
       if (result !== undefined) return result;
       if (attempt < opts.attempts) {
@@ -386,6 +436,7 @@ export class TargetCommandService implements OnModuleInit, OnModuleDestroy {
     match: (f: InBoundFrame) => T | undefined,
     timeoutMs: number,
     onSend?: () => void,
+    onTimeout?: () => void,
   ): Promise<T | undefined> {
     const key = sourceKeyOf(target);
     return new Promise<T | undefined>((resolve) => {
@@ -394,7 +445,7 @@ export class TargetCommandService implements OnModuleInit, OnModuleDestroy {
         resolve: (value) => resolve(value),
         timer: setTimeout(() => {
           this.removeWaiter(key, waiter as Waiter);
-          this.wiperQuarantineUntil.set(key, Date.now() + timeoutMs);
+          onTimeout?.();
           resolve(undefined);
         }, timeoutMs),
       };
