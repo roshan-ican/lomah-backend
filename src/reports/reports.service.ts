@@ -110,6 +110,13 @@ export class ReportsService {
         targetId: stage.targetId,
         x: shot.x,
         y: shot.y,
+        // Carried into history for the same reason it is carried live: once a
+        // session is closed, x/y is all that survives of a calibration that
+        // may have moved every shot on the board, and nothing else records
+        // what the sensor originally read. Null on sessions fired before the
+        // column existed.
+        sensorXmm: shot.sensorXmm,
+        sensorYmm: shot.sensorYmm,
         score: shot.score,
         // Read the persisted flag, never `score === 0`: a real hit that landed
         // outside every scoring ring scores 0 and is NOT a miss. Inferring it

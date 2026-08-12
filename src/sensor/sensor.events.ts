@@ -17,6 +17,12 @@ export interface ShotEvent {
   shotNumber: number;
   x: number;
   y: number;
+  /** Where the board put the bullet before the target's calibration offset, in
+   *  the same millimetres as x/y. Absent on misses and lost placeholders, and
+   *  on shots recorded before the column existed — a client must render nothing
+   *  in that case rather than falling back to x/y or to zero. */
+  sensorXmm?: number;
+  sensorYmm?: number;
   score: number;
   /** Sensor fired, resolved nothing. The frame arrived; x/y are meaningless. */
   isMiss: boolean;

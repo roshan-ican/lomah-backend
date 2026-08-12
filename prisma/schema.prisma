@@ -258,6 +258,15 @@ model Shot {
   x Int
   y Int
 
+  /// The same millimetres BEFORE that offset — where the board itself said the
+  /// bullet went. Written once at ingest and never re-scored, which is the
+  /// whole point: setOffset shifts x/y by a delta and calibrateShot overwrites
+  /// them outright, so after either of those x/y no longer carries any record
+  /// of the original reading. Null on rows written before this column existed,
+  /// and on lost placeholders, which never had a reading to record.
+  sensorXmm Int?
+  sensorYmm Int?
+
   score  Int     @default(0)
 
   /// The board reported this bullet but resolved no coordinates — a sentinel
