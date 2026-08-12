@@ -1,13 +1,24 @@
 import 'reflect-metadata';
+// Must stay above every other import: it populates process.env from .env
+// before any module body runs. See common/env-bootstrap.ts.
+import './common/env-bootstrap';
 
 import { Logger, ValidationPipe } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { NestFactory } from '@nestjs/core';
 
 import { AppModule } from './app.module';
+import { prepareDatabase } from './common/prisma/prepare-database';
 import { BroadcastLogger } from './realtime/broadcast.logger';
 
 async function bootstrap(): Promise<void> {
+  // Schema first, and to completion. This replaces the `prisma migrate deploy`
+  // the desktop shell used to run before spawning us, and it has to stay ahead
+  // of NestFactory.create for the same reason that did: SessionRecoveryService
+  // queries sessions from its own onModuleInit, and Nest gives no ordering
+  // guarantee that would put a migration before it.
+  await prepareDatabase();
+
   // Same console output as the default logger, plus a copy of every line on
   // serverLogs$ for the admin console's activity log.
   const app = await NestFactory.create(AppModule, {

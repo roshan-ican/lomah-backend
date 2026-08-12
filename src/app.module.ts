@@ -1,6 +1,3 @@
-import { existsSync } from 'node:fs';
-import { join } from 'node:path';
-
 import { Module, type MiddlewareConsumer, type NestModule } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { ScheduleModule } from '@nestjs/schedule';
@@ -8,6 +5,8 @@ import { ServeStaticModule } from '@nestjs/serve-static';
 
 import { PrismaModule } from './common/prisma/prisma.module';
 import { RequestLoggerMiddleware } from './common/request-logger.middleware';
+import { ENV_FILES, resolveStaticDir } from './common/runtime-paths';
+import { validateEnv } from './common/env-validation';
 import { TransportModule } from './transport/transport.module';
 import { TargetsModule } from './targets/targets.module';
 import { AuthModule } from './auth/auth.module';
@@ -19,25 +18,6 @@ import { ShootersModule } from './shooters/shooters.module';
 import { ReportsModule } from './reports/reports.module';
 import { DiscoveryModule } from './discovery/discovery.module';
 import { SystemModule } from './system/system.module';
-
-/**
- * The frontend build sits in a different place depending on how this process
- * was started, mirroring frontend/electron-app/main.ts's resolveFrontendDir.
- * Resolved off process.cwd(), not __dirname: `nest start --watch` bundles
- * everything through webpack HMR into one file, which makes __dirname
- * unreliable, but cwd is pinned in every launch path — `npm run start:dev`
- * runs from lomah-nest/, and the Electron-spawned `node dist/src/main.js` is
- * spawned with `cwd: BACKEND_DIR` explicitly.
- *   - packaged Electron build: backend and frontend are sibling folders under
- *     resourcesPath/app (cwd …/app/backend, frontend at …/app/dist)
- *   - dev / unpackaged: cwd is <repo>/lomah-nest, frontend build is a sibling
- *     folder at <repo>/frontend/dist
- */
-function resolveFrontendDist(): string {
-  const packagedDist = join(process.cwd(), '..', 'dist');
-  if (existsSync(join(packagedDist, 'index.html'))) return packagedDist;
-  return join(process.cwd(), '..', 'frontend', 'dist');
-}
 
 /**
  * Module layout mirrors the domain, not the file types.
@@ -54,7 +34,11 @@ function resolveFrontendDist(): string {
  */
 @Module({
   imports: [
-    ConfigModule.forRoot({ isGlobal: true, envFilePath: ['.env', '.env.local'] }),
+    // envFilePath is absolute (see common/runtime-paths.ts). Relative paths are
+    // resolved by dotenv against the working directory, so a launch from any
+    // other folder silently lost every setting and ran on code defaults —
+    // which for SENSOR_RESEND_ENABLED means the opposite of what .env says.
+    ConfigModule.forRoot({ isGlobal: true, envFilePath: ENV_FILES, validate: validateEnv }),
     ScheduleModule.forRoot(),
     // Serves the built admin/shooter SPA for everything outside /api and
     // /health. Without this, the shooter's post-assignment redirect to
@@ -62,7 +46,7 @@ function resolveFrontendDist(): string {
     // backend is the only thing listening on that port, so it has to be the
     // one to hand back index.html and let React Router take it from there.
     ServeStaticModule.forRoot({
-      rootPath: resolveFrontendDist(),
+      rootPath: resolveStaticDir(),
       exclude: ['/api/(.*)', '/health'],
       serveStaticOptions: {
         // index.html must NEVER be cached; the hashed bundles it points at

@@ -1,9 +1,15 @@
 node_modules/
 dist/
+# Built by scripts/collect-prisma-runtime.mjs from node_modules — a build
+# artifact, and 20 MB of it is a native query engine.
+prisma-runtime/
 *.log
 .env
 .env.local
 *.db
+# Databases moved aside rather than deleted while consolidating on
+# prisma/lomah.db as the single live one.
+*.stale-*
 *.db-journal
 prisma/migrations/dev.db*
 .DS_Store
