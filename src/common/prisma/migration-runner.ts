@@ -45,6 +45,20 @@ interface MigrationClient {
   $queryRawUnsafe<T = unknown>(query: string, ...values: unknown[]): Promise<T>;
 }
 
+/**
+ * Carries the backup path out to the caller, because restoring it has to
+ * happen after the client disconnects — see prepare-database.ts.
+ */
+export class MigrationFailedError extends Error {
+  constructor(
+    readonly cause: unknown,
+    readonly backupPath: string | null,
+  ) {
+    super(`migration failed: ${String(cause)}`);
+    this.name = 'MigrationFailedError';
+  }
+}
+
 export async function runMigrations(
   prisma: MigrationClient,
   logger: Logger,
@@ -66,24 +80,225 @@ export async function runMigrations(
     return;
   }
 
+  // An empty ledger does NOT mean an empty database.
+  //
+  // `prisma db push` builds a schema without recording anything, and so did
+  // several earlier builds of this app — so a tablet in the field can be
+  // carrying the complete, correct set of tables and a completely blank
+  // _prisma_migrations. Trusting the ledger alone there means replaying
+  // CREATE TABLE "lanes" over a live range database, which is precisely the
+  // crash this replaces. Look at the schema before deciding.
+  const schema = done.size === 0 ? await readSchema(prisma) : null;
+  const baselining = schema !== null && schema.size > 0;
+
+  // How far along the chain this database already is: the migration whose
+  // simulated schema is exactly what is on disk. Everything up to and
+  // including it must have run to produce that shape, so it is recorded rather
+  // than replayed; everything after it is applied normally.
+  let frontier = -1;
+  if (baselining) {
+    logger.warn(
+      'database has tables but no migration history — reconciling against the actual schema',
+    );
+
+    // findIndex, so a tie breaks towards the EARLIER migration. Two points in
+    // this history do share a shape — 20260807072916 rewrites session_stages
+    // to change constraints without touching a column — and matching cannot
+    // tell them apart. Choosing the earlier one re-runs a rewrite that adds no
+    // columns, which rebuilds the table, keeps its rows and succeeds.
+    // Choosing the later one would skip a migration that never ran.
+    const expected = simulateSchemas(pending);
+    frontier = expected.findIndex((candidate) => schemasEqual(candidate, schema));
+
+    if (frontier === -1) {
+      throw new MigrationFailedError(
+        new Error(
+          `This database has ${schema.size} table(s) but its schema does not match any point ` +
+            `in the ${pending.length}-migration history, so there is no safe place to resume ` +
+            'from. Nothing has been changed. Move the database aside to start fresh, or bring ' +
+            'it to a known migration by hand.',
+        ),
+        null,
+      );
+    }
+    logger.warn(`schema matches ${pending[frontier].name}; recording everything up to it`);
+  }
+
   // A half-applied table-redefine migration leaves the database wedged in a
   // way no amount of retrying fixes, and on a range tablet there is no
   // developer standing by to unpick it. Snapshot first, restore on failure.
   const backup = await takeBackup(prisma, databaseFile, logger);
 
-  logger.log(`applying ${pending.length} migration(s)`);
-
   try {
-    for (const migration of pending) {
+    let recorded = 0;
+    let executed = 0;
+
+    for (const [index, migration] of pending.entries()) {
+      if (index <= frontier) {
+        await record(prisma, migration, 0);
+        recorded += 1;
+        continue;
+      }
+
       await applyOne(prisma, migration, logger);
+      executed += 1;
+    }
+
+    if (recorded > 0) {
+      logger.warn(`recorded ${recorded} migration(s) as already present in the schema`);
+    }
+    if (executed > 0) {
+      logger.log(`applied ${executed} migration(s)`);
     }
   } catch (err) {
-    restore(backup, databaseFile, logger);
-    throw err;
+    throw new MigrationFailedError(err, backup);
   }
 
   if (backup) rmSync(backup, { force: true });
   logger.log(`schema up to date (${available.length} migrations applied)`);
+}
+
+// ── Reconciling a ledger-less database against its own schema ────────────────
+
+export type Schema = Map<string, Set<string>>;
+
+/** Every user table and its columns, lowercased for comparison. */
+async function readSchema(prisma: MigrationClient): Promise<Schema> {
+  const tables = await prisma.$queryRawUnsafe<Array<{ name: string }>>(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name <> '_prisma_migrations'",
+  );
+
+  const schema: Schema = new Map();
+  for (const { name } of tables) {
+    const columns = await prisma.$queryRawUnsafe<Array<{ name: string }>>(
+      `PRAGMA table_info("${name.replace(/"/g, '""')}")`,
+    );
+    schema.set(name.toLowerCase(), new Set(columns.map((c) => c.name.toLowerCase())));
+  }
+  return schema;
+}
+
+/**
+ * Replays the migrations as pure schema arithmetic, returning the shape the
+ * database should have after each one.
+ *
+ * Nothing simpler works, and both simpler things were tried. Asking "are this
+ * migration's new columns present?" gives a false NEGATIVE for early
+ * migrations, whose columns later migrations legitimately drop — the very
+ * first one creates a `lanes` that no current database still has. Scanning
+ * from the newest backwards instead gives a false POSITIVE: 20260807072916
+ * rewrites `session_stages` to change constraints without adding a single
+ * column, so it looks satisfied on a database where it never ran, and
+ * baselining past it would silently skip the migration before it and leave
+ * `targets.commandHost` missing.
+ *
+ * Drops are the whole difficulty, and simulating them removes it. Comparing a
+ * database against a full expected shape is exact: it either equals the state
+ * after migration N or it does not.
+ *
+ * The vocabulary is small because Prisma's SQLite output is small. A table
+ * rewrite is always CREATE "new_x" / DROP "x" / RENAME "new_x" TO "x", and
+ * everything else is CREATE TABLE, ADD COLUMN, DROP TABLE or an index.
+ */
+export function simulateSchemas(migrations: MigrationFile[]): Schema[] {
+  const state: Schema = new Map();
+  const snapshots: Schema[] = [];
+
+  for (const migration of migrations) {
+    for (const statement of splitStatements(migration.sql)) {
+      applyToSchema(state, statement);
+    }
+    snapshots.push(new Map([...state].map(([t, c]) => [t, new Set(c)])));
+  }
+
+  return snapshots;
+}
+
+function applyToSchema(state: Schema, statement: string): void {
+  const create = /^CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?"([^"]+)"\s*\(/i.exec(statement);
+  if (create) {
+    const body = balancedBody(statement, create[0].length - 1);
+    const columns = new Set<string>();
+    for (const line of body.split('\n')) {
+      // A column definition opens with a quoted name. Table constraints open
+      // with a keyword (CONSTRAINT, PRIMARY KEY, UNIQUE), so demanding the
+      // quote first excludes them.
+      const column = /^\s*"([^"]+)"\s+\S/.exec(line);
+      if (column) columns.add(column[1].toLowerCase());
+    }
+    state.set(create[1].toLowerCase(), columns);
+    return;
+  }
+
+  const drop = /^DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?"([^"]+)"/i.exec(statement);
+  if (drop) {
+    state.delete(drop[1].toLowerCase());
+    return;
+  }
+
+  const rename = /^ALTER\s+TABLE\s+"([^"]+)"\s+RENAME\s+TO\s+"([^"]+)"/i.exec(statement);
+  if (rename) {
+    const from = rename[1].toLowerCase();
+    const to = rename[2].toLowerCase();
+    const columns = state.get(from);
+    if (columns) {
+      state.delete(from);
+      state.set(to, columns);
+    }
+    return;
+  }
+
+  const addColumn = /^ALTER\s+TABLE\s+"([^"]+)"\s+ADD\s+COLUMN\s+"([^"]+)"/i.exec(statement);
+  if (addColumn) {
+    state.get(addColumn[1].toLowerCase())?.add(addColumn[2].toLowerCase());
+    return;
+  }
+
+  const dropColumn = /^ALTER\s+TABLE\s+"([^"]+)"\s+DROP\s+COLUMN\s+"([^"]+)"/i.exec(statement);
+  if (dropColumn) {
+    state.get(dropColumn[1].toLowerCase())?.delete(dropColumn[2].toLowerCase());
+  }
+
+  // Indexes, PRAGMAs, UPDATEs and INSERTs change no shape.
+}
+
+/** Same tables, same columns. Indexes and constraints are out of scope: SQLite
+ *  does not expose them through table_info, and they never decide whether a
+ *  migration ran. */
+export function schemasEqual(a: Schema, b: Schema): boolean {
+  if (a.size !== b.size) return false;
+  for (const [table, columns] of a) {
+    const other = b.get(table);
+    if (!other || other.size !== columns.size) return false;
+    for (const column of columns) {
+      if (!other.has(column)) return false;
+    }
+  }
+  return true;
+}
+
+/** The text inside the parenthesis at `open`, honouring nesting and quotes. */
+function balancedBody(sql: string, open: number): string {
+  let depth = 0;
+  let quote: string | null = null;
+
+  for (let i = open; i < sql.length; i += 1) {
+    const ch = sql[i];
+    if (quote) {
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      continue;
+    }
+    if (ch === '(') depth += 1;
+    else if (ch === ')') {
+      depth -= 1;
+      if (depth === 0) return sql.slice(open + 1, i);
+    }
+  }
+  return '';
 }
 
 async function applyOne(
@@ -115,6 +330,22 @@ async function applyOne(
   );
 
   logger.log(`  applied ${migration.name} (${statements.length} statements)`);
+}
+
+/** Writes a finished ledger row without running anything — used when the
+ *  schema already contains everything the migration would have created. */
+async function record(
+  prisma: MigrationClient,
+  migration: MigrationFile,
+  steps: number,
+): Promise<void> {
+  await prisma.$executeRawUnsafe(
+    'INSERT INTO "_prisma_migrations" ("id","checksum","migration_name","started_at","finished_at","applied_steps_count") VALUES (?,?,?,current_timestamp,current_timestamp,?)',
+    randomUUID(),
+    migration.checksum,
+    migration.name,
+    steps,
+  );
 }
 
 function readMigrations(logger: Logger): MigrationFile[] {
@@ -233,15 +464,33 @@ async function takeBackup(
   }
 }
 
-function restore(backup: string | null, databaseFile: string | null, logger: Logger): void {
+/**
+ * Puts the pre-migration database back.
+ *
+ * MUST be called with the Prisma client already disconnected. The query engine
+ * keeps -wal and -shm open for as long as it holds the connection, so deleting
+ * them from a live process fails with EPERM on Windows — and it fails AFTER the
+ * main file has been copied back, leaving a restored database beside a
+ * write-ahead log belonging to the attempt that was just undone. That is a
+ * worse state than either outcome on its own, and it is what turned a
+ * recoverable migration error into an unrecoverable one in the field.
+ */
+export function restoreBackup(
+  backup: string | null,
+  databaseFile: string | null,
+  logger: Logger,
+): void {
   if (!backup || !databaseFile) {
     logger.error('migration failed and no backup was taken — database left as-is');
     return;
   }
   try {
-    copyFileSync(backup, databaseFile);
+    // Sidecars first. They describe the failed attempt, and a stale -wal
+    // applied over a restored main file is exactly the corruption being
+    // avoided here.
     rmSync(`${databaseFile}-wal`, { force: true });
     rmSync(`${databaseFile}-shm`, { force: true });
+    copyFileSync(backup, databaseFile);
     rmSync(backup, { force: true });
     logger.error('migration failed — database restored from the pre-migration backup');
   } catch (err) {

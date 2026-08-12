@@ -3,7 +3,7 @@ import { PrismaClient } from '@prisma/client';
 
 import { resolveDatabaseUrl } from '../runtime-paths';
 import { ensureBootstrapUser } from './first-run';
-import { runMigrations } from './migration-runner';
+import { MigrationFailedError, restoreBackup, runMigrations } from './migration-runner';
 
 /**
  * Brings the database up to date BEFORE the Nest application is created.
@@ -26,6 +26,7 @@ export async function prepareDatabase(): Promise<void> {
   const logger = new Logger('Database');
   const url = resolveDatabaseUrl(process.env.DATABASE_URL);
   const prisma = new PrismaClient({ datasources: { db: { url } } });
+  const databaseFile = databaseFileFrom(url);
 
   try {
     await prisma.$connect();
@@ -36,8 +37,19 @@ export async function prepareDatabase(): Promise<void> {
     await prisma.$queryRawUnsafe('PRAGMA journal_mode = WAL');
     await prisma.$queryRawUnsafe('PRAGMA busy_timeout = 5000');
 
-    await runMigrations(prisma, logger, databaseFileFrom(url));
+    await runMigrations(prisma, logger, databaseFile);
     await ensureBootstrapUser(prisma, logger);
+  } catch (err) {
+    if (err instanceof MigrationFailedError) {
+      // Disconnect BEFORE restoring. The query engine holds -wal and -shm open
+      // for the life of the connection, so a restore attempted from here fails
+      // on Windows halfway through and leaves the database in a state that is
+      // neither the old one nor the new one.
+      await prisma.$disconnect();
+      restoreBackup(err.backupPath, databaseFile, logger);
+      throw err.cause;
+    }
+    throw err;
   } finally {
     await prisma.$disconnect();
   }
