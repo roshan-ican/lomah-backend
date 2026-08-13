@@ -21,13 +21,15 @@ interface UserBootstrapClient {
   user: {
     count(): Promise<number>;
     create(args: {
-      data: { username: string; passwordHash: string; role: 'SUPER_ADMIN' };
+      data: { username: string; passwordHash: string; role: 'SUPER_ADMIN' | 'ADMIN' };
     }): Promise<unknown>;
   };
 }
 
 const DEFAULT_USERNAME = 'superadmin';
 const DEFAULT_PASSWORD = 'changeme123';
+const DEFAULT_ADMIN_USERNAME = 'admin';
+const DEFAULT_ADMIN_PASSWORD = 'admin123';
 
 export async function ensureBootstrapUser(
   prisma: UserBootstrapClient,
@@ -45,13 +47,20 @@ export async function ensureBootstrapUser(
       role: 'SUPER_ADMIN',
     },
   });
+  await prisma.user.create({
+    data: {
+      username: DEFAULT_ADMIN_USERNAME,
+      passwordHash: await bcrypt.hash(DEFAULT_ADMIN_PASSWORD, 10),
+      role: 'ADMIN',
+    },
+  });
 
   // Logged at warn, not log, and with the password in plain sight on purpose.
   // Whoever commissions this tablet has to be able to get in, and a credential
   // they cannot find is the same as no credential. It is only a default if
   // nobody changes it — which is what the second line is for.
   logger.warn(
-    `no accounts found — created SUPER_ADMIN "${username}" with password "${password}"`,
+    `no accounts found — created SUPER_ADMIN "${username}" with password "${password}" and ADMIN "${DEFAULT_ADMIN_USERNAME}" with password "${DEFAULT_ADMIN_PASSWORD}"`,
   );
-  logger.warn('Change this password before the system goes on the range.');
+  logger.warn('Change these passwords before the system goes on the range.');
 }
