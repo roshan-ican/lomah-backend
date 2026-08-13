@@ -49,6 +49,22 @@ interface MigrationClient {
  * Carries the backup path out to the caller, because restoring it has to
  * happen after the client disconnects — see prepare-database.ts.
  */
+/**
+ * The database holds a schema that belongs to no point in this history — an
+ * early prototype build, or one produced by a tool that left no ledger.
+ *
+ * Signals the caller to move the file aside and start again rather than
+ * refusing to boot. An offline range tablet with an app that will not open is
+ * worse than one that opens empty, and the old database is renamed rather than
+ * deleted, so the decision stays reversible.
+ */
+export class UnrecognisedSchemaError extends Error {
+  constructor() {
+    super('database schema matches no known migration');
+    this.name = 'UnrecognisedSchemaError';
+  }
+}
+
 export class MigrationFailedError extends Error {
   constructor(
     readonly cause: unknown,
@@ -111,15 +127,21 @@ export async function runMigrations(
     frontier = expected.findIndex((candidate) => schemasEqual(candidate, schema));
 
     if (frontier === -1) {
-      throw new MigrationFailedError(
-        new Error(
-          `This database has ${schema.size} table(s) but its schema does not match any point ` +
-            `in the ${pending.length}-migration history, so there is no safe place to resume ` +
-            'from. Nothing has been changed. Move the database aside to start fresh, or bring ' +
-            'it to a known migration by hand.',
-        ),
-        null,
-      );
+      // A schema from before this history existed — an early prototype build,
+      // or one built by a tool that left no ledger. There is no safe place to
+      // resume from, but refusing to start is the wrong answer on a range
+      // tablet: it leaves an operator with an app that will not open and no
+      // way to fix it. Move the database aside instead and begin again. The
+      // old file is renamed, never deleted, so nothing is lost and a developer
+      // can still recover it later.
+      // Diagnosed here, quarantined by the caller: renaming the file while the
+      // query engine still holds it open fails with EPERM on Windows, the same
+      // trap that once turned a recoverable migration error into an
+      // unrecoverable one.
+      for (const line of describeMismatch(schema, expected, pending)) {
+        logger.error(line);
+      }
+      throw new UnrecognisedSchemaError();
     }
     logger.warn(`schema matches ${pending[frontier].name}; recording everything up to it`);
   }
@@ -260,6 +282,65 @@ function applyToSchema(state: Schema, statement: string): void {
   }
 
   // Indexes, PRAGMAs, UPDATEs and INSERTs change no shape.
+}
+
+/**
+ * Explains why a database matched nothing, in terms someone can act on.
+ *
+ * "7 tables, no match" says only that something is wrong. The closest point in
+ * the history and the exact tables and columns that differ say whether this is
+ * a schema from before the history began, or a bug in the simulation above —
+ * and those need opposite responses.
+ */
+export function describeMismatch(
+  live: Schema,
+  expected: Schema[],
+  migrations: MigrationFile[],
+): string[] {
+  let best = 0;
+  let bestCost = Number.POSITIVE_INFINITY;
+
+  for (const [index, candidate] of expected.entries()) {
+    const cost = differences(live, candidate).length;
+    if (cost < bestCost) {
+      bestCost = cost;
+      best = index;
+    }
+  }
+
+  const diffs = differences(live, expected[best]);
+  return [
+    `database schema matches no point in the ${migrations.length}-migration history`,
+    `  closest is ${migrations[best].name} (${diffs.length} difference(s)):`,
+    ...diffs.slice(0, 12).map((d) => `    ${d}`),
+    ...(diffs.length > 12 ? [`    …and ${diffs.length - 12} more`] : []),
+  ];
+}
+
+function differences(live: Schema, expected: Schema): string[] {
+  const out: string[] = [];
+  const tables = new Set([...live.keys(), ...expected.keys()]);
+
+  for (const table of [...tables].sort()) {
+    const here = live.get(table);
+    const want = expected.get(table);
+
+    if (!here) {
+      out.push(`missing table "${table}"`);
+      continue;
+    }
+    if (!want) {
+      out.push(`unexpected table "${table}"`);
+      continue;
+    }
+    for (const column of [...want].sort()) {
+      if (!here.has(column)) out.push(`"${table}" is missing column "${column}"`);
+    }
+    for (const column of [...here].sort()) {
+      if (!want.has(column)) out.push(`"${table}" has unexpected column "${column}"`);
+    }
+  }
+  return out;
 }
 
 /** Same tables, same columns. Indexes and constraints are out of scope: SQLite

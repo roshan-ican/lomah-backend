@@ -1,9 +1,16 @@
+import { renameSync } from 'node:fs';
+
 import { Logger } from '@nestjs/common';
 import { PrismaClient } from '@prisma/client';
 
 import { resolveDatabaseUrl } from '../runtime-paths';
 import { ensureBootstrapUser } from './first-run';
-import { MigrationFailedError, restoreBackup, runMigrations } from './migration-runner';
+import {
+  MigrationFailedError,
+  restoreBackup,
+  runMigrations,
+  UnrecognisedSchemaError,
+} from './migration-runner';
 
 /**
  * Brings the database up to date BEFORE the Nest application is created.
@@ -25,8 +32,32 @@ import { MigrationFailedError, restoreBackup, runMigrations } from './migration-
 export async function prepareDatabase(): Promise<void> {
   const logger = new Logger('Database');
   const url = resolveDatabaseUrl(process.env.DATABASE_URL);
-  const prisma = new PrismaClient({ datasources: { db: { url } } });
   const databaseFile = databaseFileFrom(url);
+
+  try {
+    await attempt(url, databaseFile, logger);
+  } catch (err) {
+    if (!(err instanceof UnrecognisedSchemaError)) throw err;
+
+    // The schema belongs to no point in this history — a prototype build, or
+    // one produced by a tool that left no ledger. Refusing to boot is the
+    // wrong answer on a range tablet: it leaves an operator with an app that
+    // will not open and nothing they can do about it. Move the file aside and
+    // start again, once.
+    //
+    // Only reachable after attempt() has disconnected: renaming a database the
+    // query engine still holds open fails with EPERM on Windows.
+    quarantine(databaseFile, logger);
+    await attempt(url, databaseFile, logger);
+  }
+}
+
+async function attempt(
+  url: string,
+  databaseFile: string | null,
+  logger: Logger,
+): Promise<void> {
+  const prisma = new PrismaClient({ datasources: { db: { url } } });
 
   try {
     await prisma.$connect();
@@ -53,6 +84,44 @@ export async function prepareDatabase(): Promise<void> {
   } finally {
     await prisma.$disconnect();
   }
+}
+
+/**
+ * Renames an unusable database out of the way. Never deletes it.
+ *
+ * What is being moved may be the only copy of a range's records. It is not
+ * this code's decision to discard that, and a rename keeps it recoverable by
+ * anyone who later works out what schema it holds — while still letting the
+ * app open today.
+ */
+function quarantine(databaseFile: string | null, logger: Logger): void {
+  if (!databaseFile) {
+    throw new Error('cannot start: the database schema is unrecognised and has no file to move');
+  }
+
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const moved = `${databaseFile}.unrecognised-${stamp}`;
+
+  try {
+    renameSync(databaseFile, moved);
+    // The sidecars belong to the file that just moved; leaving them behind
+    // would have SQLite replay them over the new database.
+    for (const suffix of ['-wal', '-shm']) {
+      try {
+        renameSync(`${databaseFile}${suffix}`, `${moved}${suffix}`);
+      } catch {
+        // Absent is the normal case after a clean shutdown.
+      }
+    }
+  } catch (err) {
+    throw new Error(
+      `The database schema is unrecognised and it could not be moved aside: ${String(err)}. ` +
+        `Move ${databaseFile} somewhere safe by hand and start the app again.`,
+    );
+  }
+
+  logger.error(`unrecognised database moved to ${moved}`);
+  logger.error('starting with a new, empty database — the old one is kept, not deleted');
 }
 
 /** The on-disk path behind a `file:` URL, so the migration runner can snapshot
