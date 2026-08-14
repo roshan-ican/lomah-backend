@@ -20,6 +20,7 @@ import type { WiperPage } from '@/transport/protocol/frame.codec';
 import {
   isSentinel,
   scoreAt,
+  scoreShot,
   signedMm,
   toSigned16,
   SENSOR_Y_FLOOR_BIAS_MM,
@@ -458,6 +459,18 @@ export class TargetsService implements OnModuleDestroy {
         `before this target's calibration offset.`;
     }
 
+  
+    const plottable = exchange.ok && !echoed && !noDetection && rawX != null && rawY != null;
+    const scored = plottable
+      ? scoreShot({
+          rawX,
+          rawY,
+          offsetXmm: target.offsetXmm,
+          offsetYmm: target.offsetYmm,
+          profile: target.profileType,
+        })
+      : null;
+
     return {
       targetId: target.id,
       label: target.label,
@@ -472,6 +485,9 @@ export class TargetsService implements OnModuleDestroy {
       elapsedMs: exchange.elapsedMs,
       rawX,
       rawY,
+      xMm: scored?.x ?? null,
+      yMm: scored?.y ?? null,
+      score: scored?.score ?? null,
       message,
     };
   }
@@ -505,13 +521,7 @@ export class TargetsService implements OnModuleDestroy {
     };
   }
 
-  /**
-   * Write one trimmer, live. Also does not arm the board — same reasoning as
-   * readWipers. Returns the device's own reply, the whole updated page, NOT
-   * the value that was sent: confirmed by capture, a write's reply is
-   * G-shaped and carries every wiper on that page, so trusting the request
-   * body instead of this return would show a value that was never confirmed.
-   */
+
   async writeWiper(id: string, page: WiperPage, wiper: number, value: number) {
     const target = await this.findOne(id);
     await this.assertNotMidRelay(id, target.label, 'Changing sensitivity for');
@@ -685,15 +695,43 @@ export class TargetsService implements OnModuleDestroy {
     return this.setOffset(id, offsetXmm, offsetYmm, true);
   }
 
-  /**
-   * The reference shot, addressed either by row id or — the way the admin board
-   * actually holds it — by stage plus 1-based shot number. See
-   * CalibrateFromShotDto for why both forms exist.
-   *
-   * Either way the shot is re-read here rather than trusted from the request
-   * body: the caller sends only where the shot BELONGS, never where it already
-   * is, so a stale copy on the console cannot skew the derived offset.
-   */
+
+  async calibrateFromBenchShot(
+    id: string,
+    shot: number,
+    trueX: number,
+    trueY: number,
+  ) {
+    const target = await this.findOne(id);
+    await this.assertNotMidRelay(id, target.label, 'Calibrating from a read of');
+
+    const { rawX, rawY, exchange } = await this.command.readShot(
+      this.refOf(target),
+      shot,
+    );
+    if (!exchange.ok || rawX == null || rawY == null || isSentinel(rawX, rawY)) {
+      throw new BadRequestException(
+        `Could not read shot #${shot} back from ${target.label} to calibrate ` +
+          `against. Arm the target, fire a bullet at it, then try again.`,
+      );
+    }
+
+    const sensorX = toSigned16(rawX);
+    const sensorY = toSigned16(rawY) - SENSOR_Y_FLOOR_BIAS_MM;
+    const offsetXmm = trueX - sensorX;
+    const offsetYmm = trueY - sensorY;
+
+    this.logger.log(
+      `CALIBRATE FROM BENCH SHOT: ${target.label} shot #${shot} raw ` +
+        `(${sensorX}, ${sensorY}) -> operator marked true position ` +
+        `(${trueX}, ${trueY})mm.`,
+    );
+
+    // No live session to speak of, so there is no one-bullet pick to spend.
+    return this.setOffset(id, offsetXmm, offsetYmm, false);
+  }
+
+
   private async resolveReferenceShot(targetId: string, ref: ReferenceShotRef) {
     if (ref.shotId) {
       const shot = await this.prisma.shot.findUnique({

@@ -29,7 +29,7 @@ import {
   toSigned16,
   SENSOR_Y_FLOOR_BIAS_MM,
 } from './scoring';
-import type { ShotEvent } from './sensor.events';
+import type { BenchHitEvent, ShotEvent } from './sensor.events';
 import { TargetResolver } from './target-resolver.service';
 import { SensorGateService } from './sensor-gate.service';
 
@@ -138,6 +138,10 @@ export class SensorService implements OnModuleInit, OnModuleDestroy {
 
   private readonly shots = new Subject<ShotEvent>();
   readonly shots$: Observable<ShotEvent> = this.shots.asObservable();
+
+  /** Bullets that arrived with no session behind them — see BenchHitEvent. */
+  private readonly benchHits = new Subject<BenchHitEvent>();
+  readonly benchHits$: Observable<BenchHitEvent> = this.benchHits.asObservable();
 
   private readonly queues = new Map<string, Promise<unknown>>();
 
@@ -266,6 +270,7 @@ export class SensorService implements OnModuleInit, OnModuleDestroy {
     this.sub?.unsubscribe();
     this.sessionsSub?.unsubscribe();
     this.shots.complete();
+    this.benchHits.complete();
     this.queues.clear();
     this.clearAllReads();
   }
@@ -983,8 +988,38 @@ export class SensorService implements OnModuleInit, OnModuleDestroy {
 
 
     if (!stage) {
+      // Nothing is written and nothing is returned — a bullet with no stage
+      // behind it must never reach the shot log, the session totals or a
+      // report, and that is as true now as it was before this branch said
+      // anything out loud.
+      //
+      // But the frame is real, and dropping it silently is what forced the
+      // commissioning panel to ask for bullets back one number at a time.
+      // Announce it instead: scored exactly the way POST :id/read-shot scores
+      // the same bullet, so the live marker and a later re-read of it cannot
+      // disagree.
+      const benchScored = scoreShot({
+        rawX: frame.rawX,
+        rawY: frame.rawY,
+        offsetXmm: target.offsetXmm,
+        offsetYmm: target.offsetYmm,
+        profile: target.profileType,
+      });
+      this.benchHits.next({
+        targetId: target.id,
+        laneId: target.laneId,
+        targetLabel: target.label,
+        shot: absolute ?? frame.bulletCounter,
+        xMm: benchScored.x,
+        yMm: benchScored.y,
+        score: benchScored.score,
+        isMiss: benchScored.isMiss,
+        firedAt: frame.receivedAt,
+      });
       this.logger.warn(
-        `Unassigned shot from ${target.label}: no active stage on this target.`,
+        `Unassigned shot from ${target.label}: no active stage on this target. ` +
+        `Announced as a bench hit for shot #${absolute ?? frame.bulletCounter}; ` +
+        `nothing was recorded.`,
       );
       return null;
     }

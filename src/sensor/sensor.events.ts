@@ -35,3 +35,15 @@ export interface ShotEvent {
    *  counting from zero. */
   stageShotCount: number;
 }
+
+export interface BenchHitEvent {
+  targetId: string;
+  laneId: number;
+  targetLabel: string;
+  shot: number;
+  xMm: number;
+  yMm: number;
+  score: number;
+  isMiss: boolean;
+  firedAt: Date;
+}

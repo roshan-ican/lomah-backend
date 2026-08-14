@@ -45,6 +45,7 @@ export class RealtimeGateway
   server!: Server;
 
   private shotsSub?: Subscription;
+  private benchHitsSub?: Subscription;
   private sessionsSub?: Subscription;
   private targetsSub?: Subscription;
   private gateSub?: Subscription;
@@ -64,6 +65,13 @@ export class RealtimeGateway
     this.shotsSub = this.sensor.shots$.subscribe((event) => {
       this.server.to(laneRoom(event.laneId)).emit('shot', event);
       this.server.to(ADMIN_ROOM).emit('shot', event);
+    });
+
+    // Admin room only, and under a name of its own. A bench bullet is not a
+    // session shot — it has no stage, no shot number in any log and no lane
+    // display to belong to — so anything listening for 'shot' must not see it.
+    this.benchHitsSub = this.sensor.benchHits$.subscribe((event) => {
+      this.server.to(ADMIN_ROOM).emit('target:bench-hit', event);
     });
 
     this.sessionsSub = this.sessions.events$.subscribe((event) => {
@@ -102,6 +110,7 @@ export class RealtimeGateway
 
   onModuleDestroy(): void {
     this.shotsSub?.unsubscribe();
+    this.benchHitsSub?.unsubscribe();
     this.sessionsSub?.unsubscribe();
     this.targetsSub?.unsubscribe();
     this.gateSub?.unsubscribe();

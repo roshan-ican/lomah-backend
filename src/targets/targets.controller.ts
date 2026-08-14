@@ -4,6 +4,7 @@ import { CreateTargetDto } from './dto/create-target.dto';
 import { UpdateTargetDto } from './dto/update-target.dto';
 import { SetTargetOffsetDto } from './dto/set-target-offset.dto';
 import { CalibrateFromShotDto } from './dto/calibrate-from-shot.dto';
+import { CalibrateFromBenchShotDto } from './dto/calibrate-from-bench-shot.dto';
 import { ReadWipersDto } from './dto/read-wipers.dto';
 import { WriteWiperDto } from './dto/write-wiper.dto';
 import { DevDataDto } from './dto/dev-data.dto';
@@ -158,5 +159,20 @@ export class TargetsController {
   @Post(':id/calibrate')
   calibrateFromShot(@Param('id') id: string, @Body() dto: CalibrateFromShotDto) {
     return this.targetsService.calibrateFromShot(id, dto, dto.trueX, dto.trueY);
+  }
+
+
+  @Roles('SUPER_ADMIN')
+  @Post(':id/calibrate-bench')
+  calibrateFromBenchShot(
+    @Param('id') id: string,
+    @Body() dto: CalibrateFromBenchShotDto,
+  ) {
+    return this.targetsService.calibrateFromBenchShot(
+      id,
+      dto.shot,
+      dto.trueX,
+      dto.trueY,
+    );
   }
 }
