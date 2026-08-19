@@ -1,0 +1,40 @@
+{
+  "targets": {
+    "lane-1-100m": {
+      "repeatOnPlay": true,
+      "shots": [
+        { "afterMs": 46196, "bulletCounter": 1, "wireX": -48, "wireY": 1016 },
+        { "afterMs": 63807, "bulletCounter": 2, "wireX": 9, "wireY": 670 },
+        { "afterMs": 183407, "bulletCounter": 5, "wireX": 0, "wireY": 0 }
+      ],
+      "storedShots": [
+        { "bulletCounter": 3, "wireX": -1, "wireY": 163, "replyAfterReadMs": 700 },
+        { "bulletCounter": 4, "wireX": 0, "wireY": 0, "ignoreReadAttempts": 1, "replyAfterReadMs": 600 }
+      ]
+    },
+    "lane-2-100m": {
+      "repeatOnPlay": true,
+      "shots": [
+        { "afterMs": 30000, "bulletCounter": 11, "wireX": 69, "wireY": 204 },
+        { "afterMs": 55000, "bulletCounter": 12, "wireX": -14, "wireY": 643 },
+        { "afterMs": 90000, "bulletCounter": 13, "wireX": -15, "wireY": 976 }
+      ]
+    },
+    "lane-3-100m": {
+      "repeatOnPlay": true,
+      "shots": [
+        { "afterMs": 40000, "bulletCounter": 31, "wireX": 42, "wireY": 560 },
+        { "afterMs": 72000, "bulletCounter": 32, "wireX": -36, "wireY": 710 },
+        { "afterMs": 115000, "bulletCounter": 33, "wireX": 0, "wireY": 0 }
+      ]
+    },
+    "lane-4-100m": {
+      "repeatOnPlay": true,
+      "shots": [
+        { "afterMs": 20000, "bulletCounter": 61, "wireX": 18, "wireY": 540 },
+        { "afterMs": 49000, "bulletCounter": 62, "wireX": -22, "wireY": 480 },
+        { "afterMs": 82000, "bulletCounter": 63, "wireX": 51, "wireY": 820 }
+      ]
+    }
+  }
+}

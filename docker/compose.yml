@@ -1,0 +1,141 @@
+services:
+  backend:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    environment:
+      # This database is inside the named `range-test-data` volume below. It
+      # is entirely separate from the Electron application's SQLite database.
+      DATABASE_URL: file:/data/lomah-test.db?connection_limit=1
+      JWT_SECRET: local-range-simulation-only-change-before-network-use
+      PORT: "3001"
+      HOST: 0.0.0.0
+
+      # Keep the same production wire ports so target simulators exercise the
+      # real UDP transport without a test-only code path.
+      SENSOR_UDP_LISTEN_PORT: "14555"
+      SENSOR_UDP_TARGET_PORT: "14550"
+      SENSOR_UDP_RECV_BUFFER: "1048576"
+      DISCOVERY_PORT: "5002"
+
+      # Make the test observable without per-datagram logs becoming the load
+      # bottleneck. Scenarios can override these with `docker compose run -e`.
+      SENSOR_TRACE: "false"
+      SENSOR_REQUIRE_ACK: "true"
+      SENSOR_RESEND_ENABLED: "true"
+      NO_DETECT_REREAD: "true"
+    ports:
+      # 3301 is convenient for the local Vite admin proxy. 3001 is also
+      # exposed so browser shooter terminals use their normal admin port and
+      # can be assigned by their real LAN address.
+      - "3301:3001"
+      - "3001:3001"
+      - "14555:14555/udp"
+      - "5002:5002/udp"
+    healthcheck:
+      test:
+        ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/health').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+      start_period: 5s
+    volumes:
+      - range-test-data:/data
+    networks:
+      range-lan:
+        ipv4_address: 172.30.0.10
+
+  # Commission the test database once. It is idempotent, so `up` after a
+  # restart preserves an existing simulation database rather than duplicating
+  # lanes or targets.
+  range-seed:
+    image: node:22-bookworm-slim
+    depends_on:
+      backend:
+        condition: service_healthy
+    working_dir: /seed
+    volumes:
+      - ./seed-range.mjs:/seed/seed-range.mjs:ro
+    environment:
+      BACKEND_URL: http://backend:3001
+      LOMAH_BOOTSTRAP_USER: superadmin
+      LOMAH_BOOTSTRAP_PASSWORD: changeme123
+    command: ["node", "seed-range.mjs"]
+    networks:
+      - range-lan
+
+  target-lane-1:
+    build:
+      context: ..
+      dockerfile: docker/simulator/Dockerfile
+    environment:
+      TARGET_NAME: lane-1-100m
+      SCENARIO_FILE: /scenarios/real-shot.json
+      BACKEND_HOST: 172.30.0.10
+      # One tenth of the recorded timing: 46 seconds in the real log becomes
+      # 4.6 seconds here. Set TIME_SCALE=1 for an exact real-time replay.
+      TIME_SCALE: "0.1"
+    volumes:
+      - ./simulator/scenarios:/scenarios:ro
+    networks:
+      range-lan:
+        ipv4_address: 172.30.0.21
+
+  target-lane-2:
+    build:
+      context: ..
+      dockerfile: docker/simulator/Dockerfile
+    environment:
+      TARGET_NAME: lane-2-100m
+      SCENARIO_FILE: /scenarios/real-shot.json
+      BACKEND_HOST: 172.30.0.10
+      TIME_SCALE: "0.1"
+    volumes:
+      - ./simulator/scenarios:/scenarios:ro
+    networks:
+      range-lan:
+        ipv4_address: 172.30.0.22
+
+  target-lane-3:
+    build:
+      context: ..
+      dockerfile: docker/simulator/Dockerfile
+    environment:
+      TARGET_NAME: lane-3-100m
+      SCENARIO_FILE: /scenarios/real-shot.json
+      BACKEND_HOST: 172.30.0.10
+      TIME_SCALE: "0.1"
+    volumes:
+      - ./simulator/scenarios:/scenarios:ro
+    networks:
+      range-lan:
+        ipv4_address: 172.30.0.23
+
+  target-lane-4:
+    build:
+      context: ..
+      dockerfile: docker/simulator/Dockerfile
+    environment:
+      TARGET_NAME: lane-4-100m
+      SCENARIO_FILE: /scenarios/real-shot.json
+      BACKEND_HOST: 172.30.0.10
+      TIME_SCALE: "0.1"
+    volumes:
+      - ./simulator/scenarios:/scenarios:ro
+    networks:
+      range-lan:
+        ipv4_address: 172.30.0.24
+
+volumes:
+  range-test-data:
+    name: lomah-range-test-data
+
+networks:
+  # Future simulated targets join this network with their own fixed address,
+  # which makes their UDP source IP match the backend's real target resolver.
+  range-lan:
+    name: lomah-range-test-lan
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24

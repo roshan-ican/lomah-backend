@@ -1,0 +1,12 @@
+node_modules
+dist
+prisma-runtime
+coverage
+*.log
+.env
+.env.local
+*.db
+*.db-shm
+*.db-wal
+.git
+
