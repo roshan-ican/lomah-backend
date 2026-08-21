@@ -26,6 +26,11 @@ import { SessionsService } from './sessions.service';
 
 const LANE_ID = 1;
 const TARGET_ID = 'tgt-1';
+const admin = {
+  sub: 'admin-1',
+  username: 'range-admin',
+  role: 'ADMIN' as const,
+};
 
 function makePrisma(openSession: Record<string, unknown> | null) {
   const created = {
@@ -63,13 +68,15 @@ function makePrisma(openSession: Record<string, unknown> | null) {
 
 function makeService(openSession: Record<string, unknown> | null) {
   const { prisma, tx } = makePrisma(openSession);
+  const laneSchedules = { assertSessionAllowedForAdmin: vi.fn() };
   const service = new SessionsService(
     prisma as any,
     { play: vi.fn() } as any,
     { reset: vi.fn() } as any,
+    laneSchedules as any,
     { get: () => 'false' } as any,
   );
-  return { service, prisma, tx };
+  return { service, prisma, tx, laneSchedules };
 }
 
 const dto = (extra: Record<string, unknown> = {}) => ({
@@ -85,7 +92,7 @@ describe('SessionsService.create — lane occupancy', () => {
   it('persists notes instead of dropping them', async () => {
     const { service, tx } = makeService(null);
 
-    const session = await service.create(dto({ notes: 'Wind 5kt L-to-R' }) as any);
+    const session = await service.create(dto({ notes: 'Wind 5kt L-to-R' }) as any, admin);
 
     expect(tx.session.create).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -101,7 +108,7 @@ describe('SessionsService.create — lane occupancy', () => {
       status: 'CREATED',
     });
 
-    await expect(service.create(dto() as any)).rejects.toBeInstanceOf(
+    await expect(service.create(dto() as any, admin)).rejects.toBeInstanceOf(
       BadRequestException,
     );
     // Crucially: nothing was written. A refused create must not have cancelled
@@ -113,7 +120,7 @@ describe('SessionsService.create — lane occupancy', () => {
   it('names the blocking session and its status in the rejection', async () => {
     const { service } = makeService({ id: 'existing', status: 'ACTIVE' });
 
-    await expect(service.create(dto() as any)).rejects.toThrow(
+    await expect(service.create(dto() as any, admin)).rejects.toThrow(
       /existing.*ACTIVE/,
     );
   });
@@ -121,7 +128,7 @@ describe('SessionsService.create — lane occupancy', () => {
   it('replaces a CREATED session in one transaction when asked', async () => {
     const { service, tx } = makeService({ id: 'existing', status: 'CREATED' });
 
-    await service.create(dto({ replaceExisting: true }) as any);
+    await service.create(dto({ replaceExisting: true }) as any, admin);
 
     expect(tx.session.update).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -139,18 +146,33 @@ describe('SessionsService.create — lane occupancy', () => {
       const { service, tx } = makeService({ id: 'live', status });
 
       await expect(
-        service.create(dto({ replaceExisting: true }) as any),
+        service.create(dto({ replaceExisting: true }) as any, admin),
       ).rejects.toThrow(new RegExp(`is ${status} and cannot be edited`));
       expect(tx.session.create).not.toHaveBeenCalled();
     }
   });
 
   it('creates normally on a genuinely free lane', async () => {
-    const { service, tx } = makeService(null);
+    const { service, tx, laneSchedules } = makeService(null);
 
-    await service.create(dto() as any);
+    await service.create(dto() as any, admin);
 
+    expect(laneSchedules.assertSessionAllowedForAdmin).toHaveBeenCalledWith(
+      LANE_ID,
+      admin.sub,
+      { shooterId: undefined, shooterName: 'Roshan' },
+    );
     expect(tx.session.update).not.toHaveBeenCalled();
     expect(tx.session.create).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not write a manual session when another admin reserved the lane', async () => {
+    const { service, tx, laneSchedules } = makeService(null);
+    laneSchedules.assertSessionAllowedForAdmin.mockRejectedValue(
+      new BadRequestException('busy'),
+    );
+
+    await expect(service.create(dto() as any, admin)).rejects.toThrow('busy');
+    expect(tx.session.create).not.toHaveBeenCalled();
   });
 });

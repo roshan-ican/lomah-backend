@@ -18,6 +18,7 @@ import { SensorGateService } from '@/sensor/sensor-gate.service';
 import { SessionsService } from '@/sessions/sessions.service';
 import { ConnectedShootersService } from '@/auth/connected-shooters.service';
 import { TargetsService } from '@/targets/targets.service';
+import { LaneSchedulesService } from '@/lane-schedules/lane-schedules.service';
 import { recentServerLogs, serverLogs$ } from './server-log.stream';
 const ADMIN_ROOM = 'admin';
 /** Per-lane room. A shooter tablet joins exactly one of these. */
@@ -51,6 +52,7 @@ export class RealtimeGateway
   private gateSub?: Subscription;
   private logsSub?: Subscription;
   private assignmentsSub?: Subscription;
+  private laneSchedulesSub?: Subscription;
 
   constructor(
     private readonly sensor: SensorService,
@@ -59,6 +61,7 @@ export class RealtimeGateway
     private readonly targets: TargetsService,
     private readonly gate: SensorGateService,
     private readonly connectedShooters: ConnectedShootersService,
+    private readonly laneSchedules: LaneSchedulesService,
   ) { }
 
   onModuleInit(): void {
@@ -93,6 +96,13 @@ export class RealtimeGateway
       },
     );
 
+    // Invalidation only: no owner id or attendee names may be broadcast to
+    // the shared admin room. Each client refetches the privacy-filtered REST
+    // representation using its own JWT.
+    this.laneSchedulesSub = this.laneSchedules.changes$.subscribe((event) => {
+      this.server.to(ADMIN_ROOM).emit(event.type, event);
+    });
+
     // Range-wide, not lane-scoped — admin console only, unlike the other three.
     this.gateSub = this.gate.changes$.subscribe((status) => {
       this.server.to(ADMIN_ROOM).emit('sensor:gate', status);
@@ -116,6 +126,7 @@ export class RealtimeGateway
     this.gateSub?.unsubscribe();
     this.logsSub?.unsubscribe();
     this.assignmentsSub?.unsubscribe();
+    this.laneSchedulesSub?.unsubscribe();
   }
 
   async handleConnection(client: Socket): Promise<void> {

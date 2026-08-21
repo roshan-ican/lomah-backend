@@ -17,6 +17,8 @@ import { PrismaService } from '@/common/prisma/prisma.service';
 import { TargetCommandService } from '@/transport/target-command.service';
 import { SequenceTracker } from '@/transport/protocol/sequence.tracker';
 import { scoreAt } from "@/sensor/scoring";
+import { LaneSchedulesService } from '@/lane-schedules/lane-schedules.service';
+import type { JwtPayload } from '@/auth/auth.service';
 
 
 type PrismaTx = Prisma.TransactionClient;
@@ -76,13 +78,14 @@ export class SessionsService implements OnModuleDestroy {
     private readonly prisma: PrismaService,
     private readonly targetCommand: TargetCommandService,
     private readonly sequenceTracker: SequenceTracker,
+    private readonly laneSchedules: LaneSchedulesService,
     config: ConfigService,
   ) {
     this.requireAck =
       config.get<string>('SENSOR_REQUIRE_ACK', 'true') !== 'false';
   }
 
-  async create(dto: CreateSessionDto) {
+  async create(dto: CreateSessionDto, actor: JwtPayload) {
     if (dto.stages.length === 0) {
       throw new BadRequestException('At least one stage plan is required');
     }
@@ -92,6 +95,18 @@ export class SessionsService implements OnModuleDestroy {
     });
     if (!lane) {
       throw new BadRequestException(`Lane ${dto.laneId} not found`);
+    }
+
+    // The immediate/manual path remains available whenever the lane is free.
+    // During a reserved window only the admin who owns that reservation may
+    // configure sessions on it. SUPER_ADMIN retains its existing behaviour;
+    // scheduling is an ADMIN operations feature and its UI is untouched.
+    if (actor.role === 'ADMIN') {
+      await this.laneSchedules.assertSessionAllowedForAdmin(
+        dto.laneId,
+        actor.sub,
+        { shooterId: dto.shooterId, shooterName: dto.shooterName },
+      );
     }
 
     const targetIds = dto.stages.map((s) => s.targetId);

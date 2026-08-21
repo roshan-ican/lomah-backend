@@ -18,6 +18,7 @@ import { ShootersModule } from './shooters/shooters.module';
 import { ReportsModule } from './reports/reports.module';
 import { DiscoveryModule } from './discovery/discovery.module';
 import { SystemModule } from './system/system.module';
+import { LaneSchedulesModule } from './lane-schedules/lane-schedules.module';
 
 /**
  * Module layout mirrors the domain, not the file types.
@@ -80,6 +81,7 @@ import { SystemModule } from './system/system.module';
     AuthModule,
     LanesModule,
     SessionsModule,
+    LaneSchedulesModule,
     SensorModule,
     RealtimeModule,
     ShootersModule,

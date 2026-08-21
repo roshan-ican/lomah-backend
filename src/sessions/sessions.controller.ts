@@ -5,6 +5,8 @@ import { FeedbackDto } from './dto/feedback.dto';
 import { Roles } from '@/auth/decorators/roles.decorator';
 import { Public } from '@/auth/decorators/public.decorator';
 import { CalibrateShotDto } from './dto/calibrate-shot.dto';
+import { CurrentUser } from '@/auth/decorators/current-user.decorator';
+import type { JwtPayload } from '@/auth/auth.service';
 
 @Roles('SUPER_ADMIN', 'ADMIN')
 @Controller('sessions')
@@ -12,8 +14,8 @@ export class SessionsController {
   constructor(private readonly sessionsService: SessionsService) { }
 
   @Post()
-  create(@Body() dto: CreateSessionDto) {
-    return this.sessionsService.create(dto);
+  create(@Body() dto: CreateSessionDto, @CurrentUser() user: JwtPayload) {
+    return this.sessionsService.create(dto, user);
   }
 
   // Public and unauthenticated on purpose — see SessionsService.findActiveByLane.
@@ -101,4 +103,4 @@ export class SessionsController {
   resetStage(@Param('id') id: string, @Param('stageId') stageId: string) {
     return this.sessionsService.resetStageShots(id, stageId);
   }
-}  
+}

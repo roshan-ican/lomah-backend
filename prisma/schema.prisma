@@ -40,6 +40,7 @@ model Lane {
 
   targets  Target[] @relation("LaneTargets")
   sessions Session[]
+  schedules LaneSchedule[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -298,6 +299,7 @@ model Shooter {
   rank        String?
   badgeNumber String?   @unique
   sessions    Session[]
+  scheduleAttendees LaneScheduleAttendee[]
   createdAt   DateTime  @default(now())
 
   @@map("shooters")
@@ -309,8 +311,54 @@ model User {
   passwordHash String
   role         UserRole @default(ADMIN)
   createdAt    DateTime @default(now())
+  laneSchedules LaneSchedule[]
 
   @@map("users")
+}
+
+// -----------------------------------------------------------------------------
+// Lane scheduling
+// -----------------------------------------------------------------------------
+
+/// A private admin-owned reservation of an already commissioned lane.
+/// It is deliberately separate from Session: scheduling never arms hardware,
+/// creates scorecards, or changes the firing lifecycle.
+model LaneSchedule {
+  id           String   @id @default(uuid())
+  ownerAdminId String
+  ownerAdmin   User     @relation(fields: [ownerAdminId], references: [id], onDelete: Restrict)
+  laneId       Int
+  lane         Lane     @relation(fields: [laneId], references: [id], onDelete: Cascade)
+  startsAt     DateTime
+  endsAt       DateTime
+  cancelledAt  DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  attendees    LaneScheduleAttendee[]
+
+  @@index([laneId, startsAt, endsAt])
+  @@index([ownerAdminId, startsAt])
+  @@map("lane_schedules")
+}
+
+/// Expected shooter on a lane schedule. displayName is always a snapshot so
+/// a local roster rename/deletion or a future external provider going offline
+/// cannot erase who the admin expected.
+model LaneScheduleAttendee {
+  id               String                 @id @default(uuid())
+  scheduleId       String
+  schedule         LaneSchedule           @relation(fields: [scheduleId], references: [id], onDelete: Cascade)
+  shooterId        String?
+  shooter          Shooter?               @relation(fields: [shooterId], references: [id], onDelete: SetNull)
+  displayName      String
+  identitySource   ScheduleIdentitySource
+  externalProvider String?
+  externalId       String?
+  createdAt        DateTime               @default(now())
+
+  @@index([scheduleId])
+  @@index([shooterId])
+  @@map("lane_schedule_attendees")
 }
 
 /// A shooter's display device. Bound to a lane by `deviceId` rather than IP for
@@ -365,4 +413,10 @@ enum UserRole {
   /// Day-to-day range operation. Runs sessions, cannot redesign lanes.
   ADMIN
   SHOOTER
+}
+
+enum ScheduleIdentitySource {
+  LOCAL
+  MANUAL
+  EXTERNAL
 }
