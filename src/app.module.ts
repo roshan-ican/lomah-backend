@@ -19,6 +19,7 @@ import { ReportsModule } from './reports/reports.module';
 import { DiscoveryModule } from './discovery/discovery.module';
 import { SystemModule } from './system/system.module';
 import { LaneSchedulesModule } from './lane-schedules/lane-schedules.module';
+import { FaceRecognitionModule } from './face-recognition/face-recognition.module';
 
 /**
  * Module layout mirrors the domain, not the file types.
@@ -88,6 +89,7 @@ import { LaneSchedulesModule } from './lane-schedules/lane-schedules.module';
     ReportsModule,
     DiscoveryModule,
     SystemModule,
+    FaceRecognitionModule,
   ],
 })
 export class AppModule implements NestModule {
