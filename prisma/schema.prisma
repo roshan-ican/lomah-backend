@@ -293,15 +293,31 @@ model Shot {
 // People
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// A person on an admin's roster.
+///
+/// Rosters are private to the admin who enrolled them: a newly created admin
+/// starts with an empty list and builds their own. Lanes are the opposite —
+/// they are range hardware, commissioned once, and shared by everyone.
+///
+/// `name` and `badgeNumber` are unique per owner rather than globally. A single
+/// global constraint would let one admin's roster reject a name in another
+/// admin's roster that they cannot see — an "already exists" error pointing at
+/// nothing.
 model Shooter {
-  id          String    @id @default(uuid())
-  name        String    @unique
+  id           String @id @default(uuid())
+  ownerAdminId String
+  ownerAdmin   User   @relation(fields: [ownerAdminId], references: [id], onDelete: Restrict)
+
+  name        String
   rank        String?
-  badgeNumber String?   @unique
+  badgeNumber String?
   sessions    Session[]
   scheduleAttendees LaneScheduleAttendee[]
   createdAt   DateTime  @default(now())
 
+  @@unique([ownerAdminId, name])
+  @@unique([ownerAdminId, badgeNumber])
+  @@index([ownerAdminId])
   @@map("shooters")
 }
 
@@ -312,6 +328,7 @@ model User {
   role         UserRole @default(ADMIN)
   createdAt    DateTime @default(now())
   laneSchedules LaneSchedule[]
+  shooters      Shooter[]
 
   @@map("users")
 }

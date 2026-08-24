@@ -6,6 +6,7 @@ import {
 import { Prisma } from '@prisma/client';
 
 import { PrismaService } from '@/common/prisma/prisma.service';
+import type { JwtPayload } from '@/auth/auth.service';
 
 import { CreateShooterDto } from './dto/create-shooter.dto';
 import { UpdateShooterDto } from './dto/update-shooter.dto';
@@ -17,21 +18,26 @@ const UNIQUE_VIOLATION = 'P2002';
 export class ShootersService {
   constructor(private readonly prisma: PrismaService) {}
 
-  async create(dto: CreateShooterDto) {
+  async create(actor: JwtPayload, dto: CreateShooterDto) {
     try {
-      return await this.prisma.shooter.create({ data: dto });
+      return await this.prisma.shooter.create({
+        data: { ...dto, ownerAdminId: actor.sub },
+      });
     } catch (err) {
       throw this.translate(err, dto);
     }
   }
 
-  findAll() {
-    return this.prisma.shooter.findMany({ orderBy: { name: 'asc' } });
+  findAll(actor: JwtPayload) {
+    return this.prisma.shooter.findMany({
+      where: this.ownerScope(actor),
+      orderBy: { name: 'asc' },
+    });
   }
 
-  async findOne(id: string) {
-    const shooter = await this.prisma.shooter.findUnique({
-      where: { id },
+  async findOne(id: string, actor: JwtPayload) {
+    const shooter = await this.prisma.shooter.findFirst({
+      where: { id, ...this.ownerScope(actor) },
       include: {
         sessions: {
           orderBy: { createdAt: 'desc' },
@@ -53,8 +59,8 @@ export class ShootersService {
     return shooter;
   }
 
-  async update(id: string, dto: UpdateShooterDto) {
-    await this.findOne(id);
+  async update(id: string, actor: JwtPayload, dto: UpdateShooterDto) {
+    await this.findOne(id, actor);
     try {
       return await this.prisma.shooter.update({ where: { id }, data: dto });
     } catch (err) {
@@ -68,8 +74,8 @@ export class ShootersService {
    * or cascade away real scorecards, so it is refused — the roster is
    * append-mostly by design.
    */
-  async remove(id: string) {
-    await this.findOne(id);
+  async remove(id: string, actor: JwtPayload) {
+    await this.findOne(id, actor);
 
     const sessionCount = await this.prisma.session.count({
       where: { shooterId: id },
@@ -83,12 +89,12 @@ export class ShootersService {
     return this.prisma.shooter.delete({ where: { id } });
   }
 
-  /**
-   * Turn Prisma's unique-constraint error into a 400 that names the field.
-   * Left unhandled it surfaces as a 500 — "the server broke" rather than
-   * "that badge number is already taken", which is a real difference for
-   * whoever is filling in the form.
-   */
+
+  private ownerScope(actor: JwtPayload) {
+    return actor.role === 'SUPER_ADMIN' ? {} : { ownerAdminId: actor.sub };
+  }
+
+
   private translate(
     err: unknown,
     dto: CreateShooterDto | UpdateShooterDto,

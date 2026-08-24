@@ -15,6 +15,7 @@ import { SessionsModule } from './sessions/sessions.module';
 import { SensorModule } from './sensor/sensor.module';
 import { RealtimeModule } from './realtime/realtime.module';
 import { ShootersModule } from './shooters/shooters.module';
+import { UsersModule } from './users/users.module';
 import { ReportsModule } from './reports/reports.module';
 import { DiscoveryModule } from './discovery/discovery.module';
 import { SystemModule } from './system/system.module';
@@ -86,6 +87,7 @@ import { FaceRecognitionModule } from './face-recognition/face-recognition.modul
     SensorModule,
     RealtimeModule,
     ShootersModule,
+    UsersModule,
     ReportsModule,
     DiscoveryModule,
     SystemModule,

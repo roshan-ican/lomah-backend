@@ -47,7 +47,7 @@ export class LaneSchedulesService {
     this.assertTimeRange(startsAt, endsAt);
     await this.assertLane(dto.laneId);
     await this.assertNoOverlap(dto.laneId, startsAt, endsAt);
-    const attendees = await this.normalizeAttendees(dto.attendees);
+    const attendees = await this.normalizeAttendees(dto.attendees, ownerAdminId);
 
     const schedule = await this.prisma.laneSchedule.create({
       data: {
@@ -101,7 +101,7 @@ export class LaneSchedulesService {
     if (laneId !== existing.laneId) await this.assertLane(laneId);
     await this.assertNoOverlap(laneId, startsAt, endsAt, id);
     const attendees = dto.attendees
-      ? await this.normalizeAttendees(dto.attendees)
+      ? await this.normalizeAttendees(dto.attendees, ownerAdminId)
       : undefined;
 
     const schedule = await this.prisma.laneSchedule.update({
@@ -230,6 +230,7 @@ export class LaneSchedulesService {
 
   private async normalizeAttendees(
     input: LaneScheduleAttendeeDto[],
+    ownerAdminId: string,
   ): Promise<NormalizedAttendee[]> {
     if (input.length === 0) {
       throw new BadRequestException('At least one attendee is required');
@@ -241,7 +242,7 @@ export class LaneSchedulesService {
       .filter((id): id is string => Boolean(id));
     const shooters = localIds.length
       ? await this.prisma.shooter.findMany({
-          where: { id: { in: localIds } },
+          where: { id: { in: localIds }, ownerAdminId },
           select: { id: true, name: true },
         })
       : [];

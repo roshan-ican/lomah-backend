@@ -127,11 +127,15 @@ async function main() {
 
   // ── Shooter roster ─────────────────────────────────────────────────────────
   // Scoring records, NOT accounts — shooters never log in.
+  //
+  // Seeded onto the bench `admin`, because a roster now belongs to one admin.
+  // The uniqueness that identifies a row is [ownerAdminId, name], so re-running
+  // the seed updates that admin's Kareem rather than anyone else's.
   for (const shooter of SHOOTERS) {
     await prisma.shooter.upsert({
-      where: { name: shooter.name },
+      where: { ownerAdminId_name: { ownerAdminId: admin.id, name: shooter.name } },
       update: { rank: shooter.rank, badgeNumber: shooter.badgeNumber },
-      create: shooter,
+      create: { ...shooter, ownerAdminId: admin.id },
     });
   }
 

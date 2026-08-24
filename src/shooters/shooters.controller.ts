@@ -9,6 +9,8 @@ import {
 } from '@nestjs/common';
 
 import { Roles } from '@/auth/decorators/roles.decorator';
+import { CurrentUser } from '@/auth/decorators/current-user.decorator';
+import type { JwtPayload } from '@/auth/auth.service';
 
 import { CreateShooterDto } from './dto/create-shooter.dto';
 import { UpdateShooterDto } from './dto/update-shooter.dto';
@@ -22,31 +24,37 @@ export class ShootersController {
   // ADMIN enrols shooters. Contrast lanes and targets, which are SUPER_ADMIN.
   @Roles('SUPER_ADMIN', 'ADMIN')
   @Post()
-  create(@Body() dto: CreateShooterDto) {
-    return this.shooters.create(dto);
+  create(@CurrentUser() user: JwtPayload, @Body() dto: CreateShooterDto) {
+    return this.shooters.create(user, dto);
   }
 
+  // No @Roles here, so any authenticated caller reaches these — what makes
+  // that safe is the owner filter in the service, not the guard.
   @Get()
-  findAll() {
-    return this.shooters.findAll();
+  findAll(@CurrentUser() user: JwtPayload) {
+    return this.shooters.findAll(user);
   }
 
   @Get(':id')
-  findOne(@Param('id') id: string) {
-    return this.shooters.findOne(id);
+  findOne(@Param('id') id: string, @CurrentUser() user: JwtPayload) {
+    return this.shooters.findOne(id, user);
   }
 
   @Roles('SUPER_ADMIN', 'ADMIN')
   @Patch(':id')
-  update(@Param('id') id: string, @Body() dto: UpdateShooterDto) {
-    return this.shooters.update(id, dto);
+  update(
+    @Param('id') id: string,
+    @CurrentUser() user: JwtPayload,
+    @Body() dto: UpdateShooterDto,
+  ) {
+    return this.shooters.update(id, user, dto);
   }
 
   // Deleting a person from the roster is destructive and refused outright once
   // they have session history — SUPER_ADMIN only.
   @Roles('SUPER_ADMIN')
   @Delete(':id')
-  remove(@Param('id') id: string) {
-    return this.shooters.remove(id);
+  remove(@Param('id') id: string, @CurrentUser() user: JwtPayload) {
+    return this.shooters.remove(id, user);
   }
 }

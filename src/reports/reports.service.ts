@@ -1,6 +1,7 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import type { TargetProfile } from '@prisma/client';
 import { PrismaService } from '@/common/prisma/prisma.service';
+import type { JwtPayload } from '@/auth/auth.service';
 
 const HISTORY_STATUSES = ['COMPLETED', 'CANCELLED'] as const;
 const DEFAULT_RANGE_DAYS = 30;
@@ -131,7 +132,13 @@ export class ReportsService {
     return { ...session, shots };
   }
 
-  async getShooterReport(username: string, from?: string, to?: string) {
+  async getShooterReport(
+    username: string,
+    actor: JwtPayload,
+    from?: string,
+    to?: string,
+  ) {
+    await this.assertRosterAccess(username, actor);
     const rangeFrom = from ? startOfDay(from) : startOfDay(toDateOnly(daysAgo(DEFAULT_RANGE_DAYS)));
     const rangeTo = to ? endOfDay(to) : endOfDay(toDateOnly(new Date()));
 
@@ -180,11 +187,7 @@ export class ReportsService {
         : 0,
     };
 
-    // Bucketed, not one entry per raw score: FIGURE scores 1–5 and CIRCULAR
-    // scores 1–10, so raw counts are not comparable across profiles and would
-    // give the chart a different set of columns per shooter. Bucket boundaries
-    // mirror shared/coordinates.ts scoreToRingBucket so the report and the
-    // live target board agree.
+
     const ringDistribution: Record<RingBucket, number> = {
       "10": 0,
       "8-9": 0,
@@ -219,9 +222,7 @@ export class ReportsService {
           startedAt: s.startedAt,
           endedAt: s.endedAt,
           shotCount: sessionShots.length,
-          // Averaged over HITS, not all shots: a sentinel miss has no
-          // coordinates and scoring it as a zero would drag the average down
-          // for something the shooter may not have fired at all.
+        
           avgScore: sessionHits.length
             ? round2(
                 sessionHits.reduce((sum, sh) => sum + sh.score, 0) /
@@ -241,7 +242,14 @@ export class ReportsService {
     };
   }
 
-  async getShooterShots(username: string, date?: string, from?: string, to?: string) {
+  async getShooterShots(
+    username: string,
+    actor: JwtPayload,
+    date?: string,
+    from?: string,
+    to?: string,
+  ) {
+    await this.assertRosterAccess(username, actor);
     const hasRange = Boolean(from && to);
     const rangeFrom = hasRange ? startOfDay(from!) : startOfDay(date ?? toDateOnly(new Date()));
     const rangeTo = hasRange ? endOfDay(to!) : endOfDay(date ?? toDateOnly(new Date()));
@@ -263,6 +271,21 @@ export class ReportsService {
     return hasRange
       ? { username, from: toDateOnly(rangeFrom), to: toDateOnly(rangeTo), shots }
       : { username, date: toDateOnly(rangeFrom), shots };
+  }
+
+  private async assertRosterAccess(
+    username: string,
+    actor: JwtPayload,
+  ): Promise<void> {
+    if (actor.role === 'SUPER_ADMIN') return;
+
+    const shooter = await this.prisma.shooter.findFirst({
+      where: { name: username, ownerAdminId: actor.sub },
+      select: { id: true },
+    });
+    if (!shooter) {
+      throw new NotFoundException(`Shooter "${username}" not found`);
+    }
   }
 }
 
