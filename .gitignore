@@ -15,3 +15,7 @@ prisma/migrations/dev.db*
 .DS_Store
 coverage/
 .tsbuildinfo
+
+*.db-wal
+*.db-shm
+*.db-journal
