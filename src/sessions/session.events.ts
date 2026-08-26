@@ -10,6 +10,7 @@ export interface SessionCreatedEvent extends BaseSessionEvent {
     // Nullable in the schema — a walk-in session can be created before a
     // shooter is attached, so the event has to allow the same.
     shooterName: string | null;
+    requiresFaceVerification: boolean;
 }
 
 export interface SessionStartedEvent extends BaseSessionEvent {

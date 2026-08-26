@@ -14,6 +14,15 @@ function makePrisma(overrides: Record<string, unknown> = {}) {
     user: {
       findMany: vi.fn().mockResolvedValue([]),
       findUnique: vi.fn().mockResolvedValue(null),
+      findUniqueOrThrow: vi.fn().mockResolvedValue({
+        faceRecognitionEnabled: true,
+      }),
+      update: vi.fn().mockImplementation(({ data, select }: any) => {
+        const row = { faceRecognitionEnabled: data.faceRecognitionEnabled };
+        return Promise.resolve(
+          select?.faceRecognitionEnabled ? row : { id: 'user-1', ...row },
+        );
+      }),
       // Honours `select` the way real Prisma does — an over-generous stub
       // would report a passwordHash leak whether or not one is real.
       create: vi.fn().mockImplementation(({ data, select }: any) => {
@@ -122,5 +131,34 @@ describe('UsersService.findAll', () => {
     expect(args.orderBy).toEqual({ createdAt: 'asc' });
     expect(args.select.passwordHash).toBeUndefined();
     expect(rows[0]).not.toHaveProperty('passwordHash');
+  });
+});
+
+describe('UsersService preferences', () => {
+  it('reads only the current face-recognition preference', async () => {
+    const prisma = makePrisma();
+
+    await new UsersService(prisma).getPreferences('admin-1');
+
+    expect(prisma.user.findUniqueOrThrow).toHaveBeenCalledWith({
+      where: { id: 'admin-1' },
+      select: { faceRecognitionEnabled: true },
+    });
+  });
+
+  it('updates only the authenticated admin row and returns the preference', async () => {
+    const prisma = makePrisma();
+
+    const updated = await new UsersService(prisma).updatePreferences(
+      'admin-1',
+      false,
+    );
+
+    expect(prisma.user.update).toHaveBeenCalledWith({
+      where: { id: 'admin-1' },
+      data: { faceRecognitionEnabled: false },
+      select: { faceRecognitionEnabled: true },
+    });
+    expect(updated).toEqual({ faceRecognitionEnabled: false });
   });
 });

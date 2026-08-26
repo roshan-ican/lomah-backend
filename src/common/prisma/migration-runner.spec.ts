@@ -181,6 +181,7 @@ ALTER TABLE "new_targets" RENAME TO "targets";
     const final = states.at(-1)!;
     expect([...final.keys()].sort()).toEqual([
       'client_devices',
+      'face_references',
       'lane_schedule_attendees',
       'lane_schedules',
       'lanes',

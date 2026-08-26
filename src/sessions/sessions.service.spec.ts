@@ -22,6 +22,7 @@
 import { BadRequestException } from '@nestjs/common';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { USER_ROLES } from '@/auth/roles';
 import { SessionsService } from './sessions.service';
 
 const LANE_ID = 1;
@@ -29,10 +30,13 @@ const TARGET_ID = 'tgt-1';
 const admin = {
   sub: 'admin-1',
   username: 'range-admin',
-  role: 'ADMIN' as const,
+  role: USER_ROLES.ADMIN,
 };
 
-function makePrisma(openSession: Record<string, unknown> | null) {
+function makePrisma(
+  openSession: Record<string, unknown> | null,
+  faceRecognitionEnabled = true,
+) {
   const created = {
     id: 'new-session',
     laneId: LANE_ID,
@@ -54,6 +58,11 @@ function makePrisma(openSession: Record<string, unknown> | null) {
   return {
     tx,
     prisma: {
+      user: {
+        findUnique: vi
+          .fn()
+          .mockResolvedValue({ faceRecognitionEnabled }),
+      },
       lane: { findUnique: vi.fn().mockResolvedValue({ id: LANE_ID }) },
       target: {
         findMany: vi
@@ -66,8 +75,14 @@ function makePrisma(openSession: Record<string, unknown> | null) {
   };
 }
 
-function makeService(openSession: Record<string, unknown> | null) {
-  const { prisma, tx } = makePrisma(openSession);
+function makeService(
+  openSession: Record<string, unknown> | null,
+  faceRecognitionEnabled = true,
+) {
+  const { prisma, tx } = makePrisma(
+    openSession,
+    faceRecognitionEnabled,
+  );
   const laneSchedules = { assertSessionAllowedForAdmin: vi.fn() };
   const service = new SessionsService(
     prisma as any,
@@ -164,6 +179,18 @@ describe('SessionsService.create — lane occupancy', () => {
     );
     expect(tx.session.update).not.toHaveBeenCalled();
     expect(tx.session.create).toHaveBeenCalledTimes(1);
+  });
+
+  it('snapshots an ADMIN preference that disables face verification', async () => {
+    const { service, tx } = makeService(null, false);
+
+    await service.create(dto() as any, admin);
+
+    expect(tx.session.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ requiresFaceVerification: false }),
+      }),
+    );
   });
 
   it('does not write a manual session when another admin reserved the lane', async () => {

@@ -19,6 +19,8 @@ import { SequenceTracker } from '@/transport/protocol/sequence.tracker';
 import { scoreAt } from "@/sensor/scoring";
 import { LaneSchedulesService } from '@/lane-schedules/lane-schedules.service';
 import type { JwtPayload } from '@/auth/auth.service';
+import { USER_ROLES } from '@/auth/roles';
+import { resolveFaceVerificationRequirement } from './face-verification-policy';
 
 
 type PrismaTx = Prisma.TransactionClient;
@@ -101,13 +103,27 @@ export class SessionsService implements OnModuleDestroy {
     // During a reserved window only the admin who owns that reservation may
     // configure sessions on it. SUPER_ADMIN retains its existing behaviour;
     // scheduling is an ADMIN operations feature and its UI is untouched.
-    if (actor.role === 'ADMIN') {
+    if (actor.role === USER_ROLES.ADMIN) {
       await this.laneSchedules.assertSessionAllowedForAdmin(
         dto.laneId,
         actor.sub,
         { shooterId: dto.shooterId, shooterName: dto.shooterName },
       );
     }
+
+    const adminPreference =
+      actor.role === USER_ROLES.ADMIN
+        ? (
+            await this.prisma.user.findUnique({
+              where: { id: actor.sub },
+              select: { faceRecognitionEnabled: true },
+            })
+          )?.faceRecognitionEnabled
+        : undefined;
+    const requiresFaceVerification = resolveFaceVerificationRequirement(
+      actor.role,
+      adminPreference,
+    );
 
     const targetIds = dto.stages.map((s) => s.targetId);
     const targets = await this.prisma.target.findMany({
@@ -204,6 +220,7 @@ export class SessionsService implements OnModuleDestroy {
           laneId: dto.laneId,
           shooterId: dto.shooterId,
           shooterName: dto.shooterName,
+          requiresFaceVerification,
           notes: dto.notes,
           stages: {
             create: dto.stages.map((stage, index) => ({
@@ -249,7 +266,8 @@ export class SessionsService implements OnModuleDestroy {
       type: 'session:created',
       laneId: session.laneId,
       sessionId: session.id,
-      shooterName: session.shooterName
+      shooterName: session.shooterName,
+      requiresFaceVerification: session.requiresFaceVerification,
     })
     return session
   }

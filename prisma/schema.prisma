@@ -151,6 +151,11 @@ model Session {
   shooter     Shooter? @relation(fields: [shooterId], references: [id])
   shooterName String?
 
+  /// Snapshot of the creating admin's identity-verification preference.
+  /// Kept on the session so changing the preference cannot unlock or block a
+  /// relay that is already configured or running.
+  requiresFaceVerification Boolean @default(true)
+
   /// When the current pause began, null when running. Paired with
   /// `totalPausedMs`: pause() stamps this, resume() folds the elapsed interval
   /// into the total and clears it. Without the stamp there is no way to know
@@ -321,11 +326,51 @@ model Shooter {
   @@map("shooters")
 }
 
+/// A stored face reference photo, reduced to the embedding the recogniser
+/// produced from it. The photograph itself is never kept: an embedding cannot
+/// be turned back into a face, so a copied database does not leak likenesses.
+///
+/// Keyed by person NAME rather than by Shooter id, because that is what the
+/// lane session carries (`Session.shooterName`) and what the controller
+/// resolves before any face code runs. A session may name a shooter who has no
+/// row in `shooters` at all.
+///
+/// `modelVersion` and `dimension` are stored per row so a future model swap is
+/// detectable instead of silently comparing vectors from two different models,
+/// which would produce confident nonsense.
+model FaceReference {
+  id String @id @default(uuid())
+
+  personName String
+  /// "front" | "side" — SQLite has no enums, and the native layer validates it.
+  view       String
+
+  /// The embedding as little-endian f32s: `dimension * 4` bytes.
+  embedding      Bytes
+  dimension      Int
+  modelVersion   String
+  /// The detector's confidence in the face this embedding came from, kept for
+  /// diagnosing a bad reference photo after the fact.
+  detectionScore Float?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// One reference per view per person: registering the same view twice
+  /// replaces it rather than accumulating stale photos.
+  @@unique([personName, view])
+  @@index([personName])
+  @@map("face_references")
+}
+
 model User {
   id           String   @id @default(uuid())
   username     String   @unique
   passwordHash String
   role         UserRole @default(ADMIN)
+  /// Default copied onto new sessions created by this ADMIN. Existing
+  /// sessions keep their own snapshot.
+  faceRecognitionEnabled Boolean @default(true)
   createdAt    DateTime @default(now())
   laneSchedules LaneSchedule[]
   shooters      Shooter[]
