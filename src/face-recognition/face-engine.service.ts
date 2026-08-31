@@ -40,6 +40,7 @@ export interface FaceModelInfo {
  *  here is how the two drift apart. */
 interface LomahCore {
   getFaceModelInfo(): FaceModelInfo;
+  faceEmbeddingDistance(candidate: Buffer, reference: Buffer): number;
   warmFaceModels(runtimeDir: string): Promise<void>;
   encodeFace(jpeg: Buffer, runtimeDir: string): Promise<FaceEncodingResult>;
   verifyFace(
@@ -127,6 +128,10 @@ export class FaceEngineService implements OnModuleInit {
 
   encode(jpeg: Buffer): Promise<FaceEncodingResult> {
     return this.load().encodeFace(jpeg, this.requireRuntimeDir());
+  }
+
+  embeddingDistance(candidate: Buffer, reference: Buffer): number {
+    return this.load().faceEmbeddingDistance(candidate, reference);
   }
 
   verify(

@@ -182,6 +182,16 @@ export class FaceRecognitionService {
         );
       }
 
+      const existingOwner = await this.registeredFaceOwner(
+        person,
+        encoded.embedding,
+      );
+      if (existingOwner) {
+        throw new ConflictException(
+          `Face already registered as ${existingOwner}. ${existingOwner}, you are not ${person}.`,
+        );
+      }
+
       // Prisma types a Bytes column as Uint8Array<ArrayBuffer>, which Node's
       // Buffer (ArrayBufferLike) does not satisfy. Copy rather than cast.
       const embedding = new Uint8Array(encoded.embedding);
@@ -278,6 +288,46 @@ export class FaceRecognitionService {
     });
     const captured = new Set(stored.map((reference) => reference.view));
     return REQUIRED_VIEWS.filter((view) => captured.has(view));
+  }
+
+  /**
+   * Enrollment is not permission to create a second identity for a known face.
+   * Compare the freshly encoded face with every compatible reference belonging
+   * to another shooter and report the closest owner inside the normal match
+   * threshold. The same shooter's own front/side re-registration stays valid.
+   */
+  private async registeredFaceOwner(
+    person: string,
+    candidate: Buffer,
+  ): Promise<string | null> {
+    const stored = await this.prisma.faceReference.findMany({
+      orderBy: [{ personName: "asc" }, { view: "asc" }],
+    });
+    const { modelVersion, embeddingDimension } = this.engine.modelInfo();
+    let closest: { person: string; distance: number } | null = null;
+
+    for (const reference of stored) {
+      if (reference.personName === person) continue;
+      if (
+        reference.modelVersion !== modelVersion ||
+        reference.dimension !== embeddingDimension ||
+        reference.embedding.length !== embeddingDimension * 4
+      ) {
+        continue;
+      }
+
+      const distance = this.engine.embeddingDistance(
+        candidate,
+        Buffer.from(reference.embedding),
+      );
+      if (!closest || distance < closest.distance) {
+        closest = { person: reference.personName, distance };
+      }
+    }
+
+    return closest && closest.distance <= this.engine.matchThreshold()
+      ? closest.person
+      : null;
   }
 
   private isComplete(capturedViews: FaceRegistrationView[]): boolean {

@@ -41,8 +41,15 @@ function makePrisma(rows: StoredReference[] = []) {
   return {
     rows,
     faceReference: {
-      findMany: vi.fn(({ where }: { where: { personName: string } }) =>
-        Promise.resolve(rows.filter((row) => row.personName === where.personName)),
+      findMany: vi.fn(
+        (args?: { where?: { personName?: string }; select?: { view?: boolean } }) => {
+          const personName = args?.where?.personName;
+          return Promise.resolve(
+            personName
+              ? rows.filter((row) => row.personName === personName)
+              : rows,
+          );
+        },
       ),
       upsert: vi.fn(
         ({
@@ -78,6 +85,7 @@ function makeEngine(overrides: Record<string, unknown> = {}) {
       defaultL2Threshold: 1.128,
     }),
     matchThreshold: vi.fn().mockReturnValue(1.128),
+    embeddingDistance: vi.fn().mockReturnValue(2),
     encode: vi.fn().mockResolvedValue({
       status: "encoded",
       embedding: Buffer.from(embedding()),
@@ -156,6 +164,42 @@ describe("FaceRecognitionService registration", () => {
     await service.registerFace("Ahmed", "front", frame);
 
     expect(prisma.rows).toHaveLength(1);
+  });
+
+  it("rejects a face already registered under another shooter", async () => {
+    const { service, prisma } = makeService(
+      [reference("front", { personName: "Roshan" })],
+      { embeddingDistance: vi.fn().mockReturnValue(0.2) },
+    );
+
+    await expect(
+      service.registerFace("Borris", "front", frame),
+    ).rejects.toThrow(
+      "Face already registered as Roshan. Roshan, you are not Borris.",
+    );
+    expect(prisma.rows).toHaveLength(1);
+  });
+
+  it("allows a genuinely different shooter to register", async () => {
+    const { service, prisma } = makeService(
+      [reference("front", { personName: "Roshan" })],
+      { embeddingDistance: vi.fn().mockReturnValue(1.4) },
+    );
+
+    await service.registerFace("Borris", "front", frame);
+
+    expect(prisma.rows).toHaveLength(2);
+  });
+
+  it("allows the same shooter to replace their own registration", async () => {
+    const distance = vi.fn().mockReturnValue(0);
+    const { service } = makeService([reference("front")], {
+      embeddingDistance: distance,
+    });
+
+    await service.registerFace("Ahmed", "front", frame);
+
+    expect(distance).not.toHaveBeenCalled();
   });
 
   // 422 specifically: the tablet retries a 422 with a fresh frame, which is the

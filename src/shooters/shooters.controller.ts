@@ -50,9 +50,9 @@ export class ShootersController {
     return this.shooters.update(id, user, dto);
   }
 
-  // Deleting a person from the roster is destructive and refused outright once
-  // they have session history — SUPER_ADMIN only.
-  @Roles('SUPER_ADMIN')
+  // ADMIN may delete a shooter from their own roster. The service applies the
+  // owner scope and still refuses deletion once the shooter has session history.
+  @Roles('SUPER_ADMIN', 'ADMIN')
   @Delete(':id')
   remove(@Param('id') id: string, @CurrentUser() user: JwtPayload) {
     return this.shooters.remove(id, user);
