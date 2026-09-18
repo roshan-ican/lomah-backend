@@ -226,6 +226,8 @@ export class SessionsService implements OnModuleDestroy {
             create: dto.stages.map((stage, index) => ({
               target: { connect: { id: stage.targetId } },
               order: index,
+              profileType: targets.find((t) => t.id === stage.targetId)!
+                .profileType,
               bulletLimit: stage.bulletLimit,
               durationSeconds: stage.durationSeconds,
             })),
@@ -387,6 +389,7 @@ export class SessionsService implements OnModuleDestroy {
       stageId: first.id,
       stageOrder: first.order,
       targetId: first.targetId,
+      profileType: first.profileType,
       startedAt: now,
     });
 
@@ -441,6 +444,7 @@ export class SessionsService implements OnModuleDestroy {
       toStageId: next?.id,
       toStageOrder: next?.order,
       targetId: next?.targetId,
+      profileType: next?.profileType,
     });
     if (!next) {
       this.events.next({

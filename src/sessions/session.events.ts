@@ -18,6 +18,7 @@ export interface SessionStartedEvent extends BaseSessionEvent {
     stageId: string;
     stageOrder: number;
     targetId: string;
+    profileType: 'FIGURE' | 'CIRCULAR';
     startedAt: Date;
 }
 
@@ -32,6 +33,7 @@ export interface SessionResumedEvent extends BaseSessionEvent {
     /** The re-armed target, so listeners can reset per-target ingest state.
      *  Undefined only if the session was resumed with no ACTIVE stage. */
     targetId?: string;
+    profileType?: 'FIGURE' | 'CIRCULAR';
 }
 
 export interface SessionAdvancedEvent extends BaseSessionEvent {
@@ -42,6 +44,7 @@ export interface SessionAdvancedEvent extends BaseSessionEvent {
     /** The newly armed target. Undefined on the final advance, which ends the
      *  session rather than arming anything. Same purpose as on resume. */
     targetId?: string;
+    profileType?: 'FIGURE' | 'CIRCULAR';
 }
 
 export interface SessionCompletedEvent extends BaseSessionEvent {

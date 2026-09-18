@@ -52,6 +52,17 @@ export class TargetsService implements OnModuleDestroy {
     private readonly sequenceTracker: SequenceTracker,
   ) { }
 
+  private async webPageAnswers(ip: string): Promise<boolean> {
+    try {
+      const res = await fetch(`http://${ip}/gpio_status`, {
+        signal: AbortSignal.timeout(1500),
+      });
+      return res.ok;
+    } catch {
+      return false;
+    }
+  }
+
   onModuleDestroy(): void {
     this.calibrations.complete();
   }
@@ -272,8 +283,12 @@ export class TargetsService implements OnModuleDestroy {
           : outcome === 'NOT_ARMED'
             ? `${target.label} (${target.ipAddress}) reported it was not armed. ` +
               `Retest — this should not happen right after a successful PLAY.`
-            : `${target.label} (${target.ipAddress}) did not answer. Check that it is ` +
-              `powered, associated to the range router, and reserved at this address.`;
+            : (await this.webPageAnswers(target.ipAddress))
+              ? `${target.label} (${target.ipAddress}) is online but sends its replies to ` +
+                `another PC. On http://${target.ipAddress}/ set Target IP to 255.255.255.255 and ` +
+                `Target UDP Port to 14555, then Save & Reboot.`
+              : `${target.label} (${target.ipAddress}) did not answer. Check that it is ` +
+                `powered, associated to the range router, and reserved at this address.`;
 
     return {
       targetId: target.id,

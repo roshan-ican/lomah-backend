@@ -10,10 +10,33 @@ import { WriteWiperDto } from './dto/write-wiper.dto';
 import { DevDataDto } from './dto/dev-data.dto';
 import { ReadShotDto } from './dto/read-shot.dto';
 import { Roles } from '@/auth/decorators/roles.decorator';
+import { TargetLiftService } from './target-lift.service';
+import { MoveLiftDto } from './dto/move-lift.dto';
 
 @Controller('targets')
 export class TargetsController {
-  constructor(private readonly targetsService: TargetsService) {}
+  constructor(
+    private readonly targetsService: TargetsService,
+    private readonly liftService: TargetLiftService,
+  ) {}
+
+  @Roles('SUPER_ADMIN', 'ADMIN')
+  @Post('lift-all')
+  moveAllLifts(@Body() dto: MoveLiftDto) {
+    return this.liftService.moveAll(dto.position);
+  }
+
+  @Roles('SUPER_ADMIN', 'ADMIN')
+  @Get(':id/lift')
+  liftStatus(@Param('id') id: string) {
+    return this.liftService.status(id);
+  }
+
+  @Roles('SUPER_ADMIN', 'ADMIN')
+  @Post(':id/lift')
+  moveLift(@Param('id') id: string, @Body() dto: MoveLiftDto) {
+    return this.liftService.move(id, dto.position);
+  }
 
   // Structural changes to hardware — adding a target, moving its IP,
   // recalibrating it — are commissioning actions. SUPER_ADMIN only.
