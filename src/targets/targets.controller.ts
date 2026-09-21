@@ -26,6 +26,15 @@ export class TargetsController {
     return this.liftService.moveAll(dto.position);
   }
 
+  // Dashboard calls this once on render instead of one request per switch.
+  // MUST stay above @Get(':id') and @Get(':id/lift') — Nest matches routes in
+  // declaration order, and ':id' would otherwise swallow '/targets/lift'.
+  @Roles('SUPER_ADMIN', 'ADMIN')
+  @Get('lift')
+  liftStatusAll() {
+    return this.liftService.statusAll();
+  }
+
   @Roles('SUPER_ADMIN', 'ADMIN')
   @Get(':id/lift')
   liftStatus(@Param('id') id: string) {
