@@ -112,6 +112,10 @@ model Target {
   /// heartbeat overwrites it with whatever the physical board reports.
   firmwareVersion String @default("LOMAH Dev Board v0.1")
 
+  /// Sensitivity values an officer saved as this board's default, restored by
+  /// the Reset button. Shape: { "A": number[5], "B": number[5] }, either page optional.
+  sensitivityDefaults Json?
+
   /// Every session-stage this target has ever been engaged in. Not a direct
   /// relation to Session — a target is engaged as part of a STAGE, and a
   /// session reaches its targets by walking its stages. See SessionStage.
@@ -241,6 +245,11 @@ model SessionStage {
   /// silently rescore a stage that already happened.
   profileType TargetProfile @default(FIGURE)
 
+  /// What the target does during the stage. Shape of modeConfig is validated
+  /// by validateStageMode (src/sessions/stage-mode.ts); null for STATIC.
+  mode       StageMode @default(STATIC)
+  modeConfig Json?
+
   shots Shot[]
 
   @@unique([sessionId, order])
@@ -288,6 +297,10 @@ model Shot {
   isLost Boolean @default(false)
 
   firedAt DateTime
+
+  /// Timed stages only: which exposure this shot belongs to, and when it began.
+  exposureIndex     Int?
+  exposureStartedAt DateTime?
 
   @@unique([sessionStageId, shotNumber])
   @@index([sessionStageId])
@@ -461,6 +474,13 @@ enum SessionStatus {
   COMPLETED
   CANCELLED
   SUPERSEDED
+}
+
+enum StageMode {
+  STATIC
+  TIMELINE
+  REACTIVE
+  COMBINED
 }
 
 enum StageStatus {

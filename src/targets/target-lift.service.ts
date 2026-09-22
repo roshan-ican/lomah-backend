@@ -21,10 +21,11 @@ const HTTP_TIMEOUT_MS = 4000;
 
 // How long the lift takes to finish travelling. The background check waits
 // this long before reading, so it never sees a target mid-travel and "fixes"
-// it with another toggle. MEASURE THIS on the slowest target and set it to
-// comfortably more than the real figure — too long is harmless, too short
-// risks a spurious resend.
-const TRAVEL_MS = 1500;
+// it with another toggle. 300ms (from the dev target's 90-100ms) was too
+// tight on the range boards: they reported late, the verify resent, and a
+// resent TOGGLE flips the target back. A stage program's next command bumps
+// the version, so a pending verify never lands mid-program.
+const TRAVEL_MS = 1000;
 
 @Injectable()
 export class TargetLiftService implements OnModuleInit {
@@ -125,10 +126,19 @@ export class TargetLiftService implements OnModuleInit {
 
   // ----------------------------------------------------------------- moving
 
-  async move(id: string, to: LiftPosition): Promise<LiftState> {
+  /** `fresh` reads the board first instead of trusting the cache — for stage
+   *  start, where a target moved by hand since the last command must still end up right. */
+  async move(id: string, to: LiftPosition, opts?: { fresh?: boolean }): Promise<LiftState> {
     const ip = await this.ipOf(id);
 
-    const known = this.lastKnown.get(ip) ?? (await this.read(ip));
+    const cached = this.lastKnown.get(ip);
+    const known =
+      opts?.fresh || !cached
+        ? await this.read(ip).catch((err) => {
+            if (cached) return cached;
+            throw err;
+          })
+        : cached;
     if (known.position === to) return known;
 
     await this.call(ip, '/toggle?pin=2');

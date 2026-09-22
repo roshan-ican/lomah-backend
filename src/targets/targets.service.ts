@@ -27,6 +27,8 @@ import {
 } from '@/sensor/scoring';
 import type { TargetCalibratedEvent } from './target.events';
 
+const WIPER_CONFIRM_MS = 20_000;
+
 /** Prisma's code for "a unique constraint was violated". */
 const UNIQUE_VIOLATION = 'P2002';
 
@@ -530,6 +532,7 @@ export class TargetsService implements OnModuleDestroy {
       targetId: id,
       page,
       values: read.values,
+      defaults: this.defaultsFor(target.sensitivityDefaults, page),
       readAt: new Date().toISOString(),
       txHex: read.exchange.txHex,
       rxHex: read.exchange.rxHex,
@@ -537,16 +540,65 @@ export class TargetsService implements OnModuleDestroy {
   }
 
 
+  private defaultsFor(stored: Prisma.JsonValue, page: WiperPage): number[] | null {
+    const values = (stored as Record<string, unknown> | null)?.[page];
+    return Array.isArray(values) ? (values as number[]) : null;
+  }
+
+  async saveWiperDefaults(id: string, page: WiperPage) {
+    const live = await this.readWipers(id, page);
+    const target = await this.findOne(id);
+    const stored = (target.sensitivityDefaults as Record<string, number[]> | null) ?? {};
+    await this.prisma.target.update({
+      where: { id },
+      data: { sensitivityDefaults: { ...stored, [page]: live.values } },
+    });
+    this.logger.log(
+      `WIPER DEFAULT → ${target.label} (${target.ipAddress}): ${page} saved as ${live.values.join(',')}`,
+    );
+    return { ...live, defaults: live.values };
+  }
+
+  async resetWipers(id: string, page: WiperPage) {
+    const target = await this.findOne(id);
+    const defaults = this.defaultsFor(target.sensitivityDefaults, page);
+    if (!defaults) {
+      throw new BadRequestException(
+        `${target.label} has no saved default for Calibration ${page}. Save one first.`,
+      );
+    }
+    let result = await this.readWipers(id, page);
+    for (let i = 0; i < defaults.length; i++) {
+      if (result.values[i] === defaults[i]) continue;
+      result = await this.writeWiper(id, page, i + 1, defaults[i]);
+    }
+    this.logger.log(
+      `WIPER RESET → ${target.label} (${target.ipAddress}): ${page} restored to ${defaults.join(',')}`,
+    );
+    return result;
+  }
+
   async writeWiper(id: string, page: WiperPage, wiper: number, value: number) {
     const target = await this.findOne(id);
     await this.assertNotMidRelay(id, target.label, 'Changing sensitivity for');
 
-    const read = await this.command.writeWiper(
+    let read = await this.command.writeWiper(
       this.refOf(target),
       page,
       wiper,
       value,
     );
+    if (!read) {
+      // This board applies 'W' silently and then ignores everything for ~8s,
+      // so keep re-reading until it answers before judging the write.
+      const deadline = Date.now() + WIPER_CONFIRM_MS;
+      while (!read && Date.now() < deadline) {
+        const check = await this.command.getWiperPage(this.refOf(target), page);
+        if (!check) continue;
+        if (check.values[wiper - 1] === value) read = check;
+        else break;
+      }
+    }
     if (!read) {
       throw new ServiceUnavailableException(
         `${target.label} (${target.ipAddress}) did not answer a wiper write. ` +
@@ -562,6 +614,7 @@ export class TargetsService implements OnModuleDestroy {
       targetId: id,
       page,
       values: read.values,
+      defaults: this.defaultsFor(target.sensitivityDefaults, page),
       readAt: new Date().toISOString(),
       txHex: read.exchange.txHex,
       rxHex: read.exchange.rxHex,

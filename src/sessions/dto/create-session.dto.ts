@@ -1,5 +1,6 @@
 import { Type } from "class-transformer";
-import { IsArray, IsBoolean, IsInt, IsOptional, IsString, MaxLength, Min, ValidateNested } from "class-validator";
+import { IsArray, IsBoolean, IsIn, IsInt, IsObject, IsOptional, IsString, MaxLength, Min, ValidateNested } from "class-validator";
+import { STAGE_MODES } from "../stage-mode";
 
 class StagePlanDto {
 
@@ -23,6 +24,15 @@ class StagePlanDto {
     @IsInt()
     @Min(0)
     durationSeconds?: number;
+
+    @IsOptional()
+    @IsIn(STAGE_MODES)
+    mode?: string;
+
+    /** Shape checked by validateStageMode in SessionsService.create. */
+    @IsOptional()
+    @IsObject()
+    modeConfig?: Record<string, unknown>;
 
 }
 

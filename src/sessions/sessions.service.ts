@@ -21,6 +21,7 @@ import { LaneSchedulesService } from '@/lane-schedules/lane-schedules.service';
 import type { JwtPayload } from '@/auth/auth.service';
 import { USER_ROLES } from '@/auth/roles';
 import { resolveFaceVerificationRequirement } from './face-verification-policy';
+import { StageModeError, validateStageMode } from './stage-mode';
 
 
 type PrismaTx = Prisma.TransactionClient;
@@ -124,6 +125,17 @@ export class SessionsService implements OnModuleDestroy {
       actor.role,
       adminPreference,
     );
+
+    const stageModes = dto.stages.map((stage, index) => {
+      try {
+        return validateStageMode(stage);
+      } catch (err) {
+        if (err instanceof StageModeError) {
+          throw new BadRequestException(`Stage ${index + 1}: ${err.message}`);
+        }
+        throw err;
+      }
+    });
 
     const targetIds = dto.stages.map((s) => s.targetId);
     const targets = await this.prisma.target.findMany({
@@ -229,7 +241,11 @@ export class SessionsService implements OnModuleDestroy {
               profileType: targets.find((t) => t.id === stage.targetId)!
                 .profileType,
               bulletLimit: stage.bulletLimit,
-              durationSeconds: stage.durationSeconds,
+              durationSeconds: stageModes[index].durationSeconds,
+              mode: stageModes[index].mode,
+              modeConfig: stageModes[index].modeConfig
+                ? (stageModes[index].modeConfig as Prisma.InputJsonObject)
+                : Prisma.DbNull,
             })),
           },
         },

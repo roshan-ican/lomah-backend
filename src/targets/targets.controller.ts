@@ -166,6 +166,18 @@ export class TargetsController {
     return this.targetsService.writeWiper(id, dto.page, dto.wiper, dto.value);
   }
 
+  @Roles('SUPER_ADMIN')
+  @Post(':id/wipers/default')
+  saveWiperDefaults(@Param('id') id: string, @Body() dto: ReadWipersDto) {
+    return this.targetsService.saveWiperDefaults(id, dto.page);
+  }
+
+  @Roles('SUPER_ADMIN')
+  @Post(':id/wipers/reset')
+  resetWipers(@Param('id') id: string, @Body() dto: ReadWipersDto) {
+    return this.targetsService.resetWipers(id, dto.page);
+  }
+
   /**
    * ADMIN as well as SUPER_ADMIN, unlike every other write on this controller.
    *
