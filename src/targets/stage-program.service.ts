@@ -8,6 +8,7 @@ import { SensorService } from '@/sensor/sensor.service';
 import type { SessionEvent } from '@/sessions/session.events';
 import { SessionsService } from '@/sessions/sessions.service';
 import {
+  STAGE_MODES_ENABLED,
   ruleCountsHit,
   timelinePositionAt,
   type StageModeConfig,
@@ -74,7 +75,7 @@ export class StageProgramService implements OnModuleInit, OnModuleDestroy {
 
   @Interval(TICK_MS)
   async tick(): Promise<void> {
-    if (this.ticking) return;
+    if (!STAGE_MODES_ENABLED || this.ticking) return;
     this.ticking = true;
     try {
       await this.drive();
@@ -114,7 +115,7 @@ export class StageProgramService implements OnModuleInit, OnModuleDestroy {
         `Stage ${stage.id} rule ${i + 1}: ${r.count} hits ${r.zone ?? 'any'} -> ${r.then}`,
       ),
     );
-    if (stage.mode === 'TIMELINE' || stage.mode === 'COMBINED') return;
+    if (STAGE_MODES_ENABLED && (stage.mode === 'TIMELINE' || stage.mode === 'COMBINED')) return;
 
     this.logger.log(`Stage ${stage.id} started — checking target is up`);
     this.command(stage.id, stage.targetId, 'UP', false, true);
@@ -131,7 +132,7 @@ export class StageProgramService implements OnModuleInit, OnModuleDestroy {
   // -------------------------------------------------------------- hit rules
 
   private async onShot(shot: ShotEvent): Promise<void> {
-    if (shot.isLost) return;
+    if (!STAGE_MODES_ENABLED || shot.isLost) return;
     const stage = await this.prisma.sessionStage.findUnique({
       where: { id: shot.sessionStageId },
       select: { id: true, sessionId: true, targetId: true, status: true, mode: true, modeConfig: true, profileType: true },

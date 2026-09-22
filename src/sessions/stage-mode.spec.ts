@@ -1,10 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { expandUpDurations, ruleCountsHit, StageModeError, timelinePositionAt, validateStageMode } from './stage-mode';
+import { expandUpDurations, ruleCountsHit, STAGE_MODES_ENABLED, StageModeError, timelinePositionAt, validateStageMode } from './stage-mode';
 
 const peekaboo = { repeat: 5, upForMs: [3000], downForMs: 2000 };
 const dropAfter3 = { when: 'hits', zone: 'CENTER', count: 3, then: 'END_STAGE' };
 
-describe('validateStageMode', () => {
+describe.skipIf(!STAGE_MODES_ENABLED)('validateStageMode', () => {
   it('defaults to STATIC and keeps the given duration', () => {
     expect(validateStageMode({ durationSeconds: 0 })).toEqual({
       mode: 'STATIC',
@@ -104,5 +104,14 @@ describe('ruleCountsHit', () => {
     expect(ruleCountsHit(middle, { score: 5, isMiss: false }, 'FIGURE')).toBe(true);
     expect(ruleCountsHit(middle, { score: 4, isMiss: false }, 'FIGURE')).toBe(true);
     expect(ruleCountsHit(middle, { score: 3, isMiss: false }, 'FIGURE')).toBe(false);
+  });
+});
+
+describe.skipIf(STAGE_MODES_ENABLED)('basic build', () => {
+  it('accepts STATIC and rejects any other mode', () => {
+    expect(validateStageMode({ durationSeconds: 60 }).mode).toBe('STATIC');
+    expect(() =>
+      validateStageMode({ mode: 'TIMELINE', modeConfig: { timeline: peekaboo } }),
+    ).toThrow(/not available/);
   });
 });

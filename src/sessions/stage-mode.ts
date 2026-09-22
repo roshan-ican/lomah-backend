@@ -1,3 +1,6 @@
+/** OFF on the release/basic build: only STATIC stages, no programs or hit rules. */
+export const STAGE_MODES_ENABLED: boolean = false;
+
 export const STAGE_MODES = ['STATIC', 'TIMELINE', 'REACTIVE', 'COMBINED'] as const;
 export type StageModeName = (typeof STAGE_MODES)[number];
 
@@ -122,6 +125,10 @@ export function validateStageMode(input: StageModeInput): NormalizedStageMode {
   const mode = (input.mode ?? 'STATIC') as StageModeName;
   if (!STAGE_MODES.includes(mode)) {
     throw new StageModeError(`mode must be one of ${STAGE_MODES.join(', ')}`);
+  }
+
+  if (!STAGE_MODES_ENABLED && mode !== 'STATIC') {
+    throw new StageModeError('stage modes are not available in this build');
   }
 
   if (mode === 'STATIC') {
